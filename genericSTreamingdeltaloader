@@ -1,0 +1,315 @@
+%run DPI/SPI_PAD/common/adls_config
+
+%run DPI/SPI_PAD/common/Logging_DPI
+
+# importing required packages from pyspark API
+import json
+import requests
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from pyspark.sql.functions import lit,concat,get_json_object,struct,substring_index,substring
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession
+from pyspark.sql import Row
+from pyspark.sql.functions import *
+from pyspark.sql.functions import substring,to_utc_timestamp,from_unixtime,col
+from pyspark.sql.types import StringType,DateType,StructType,DecimalType,TimestampType,LongType,DoubleType,IntegerType,StructField, ArrayType
+import pyspark.sql.functions as f
+from pyspark.sql.functions import from_utc_timestamp,to_date
+import sys,os
+import logging
+import pandas as pd
+
+import uuid
+from pyspark.sql.functions import udf
+
+from pyspark.sql.window import Window
+from delta.tables import *
+
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'generic_api_data_loader'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+logger.info('Started reading variables from widgets')
+try:
+  job_type = dbutils.widgets.get('job_type')
+  logger.info(f"Job Type: {job_type}")
+  
+  src_system = dbutils.widgets.get('src_system')
+  logger.info(f"Source system: {src_system}")
+  
+  src_tbl_name = dbutils.widgets.get('src_tbl_name')
+  logger.info(f"Source table: {src_tbl_name}")
+  
+  file_name = dbutils.widgets.get('file_name')
+  logger.info(f"File name: {file_name}")
+  
+  source_path = dbutils.widgets.get('source_path')
+  logger.info(f"Source path: {source_path}")
+  
+  tgt_path = dbutils.widgets.get('tgt_path')
+  logger.info(f"Target path: {tgt_path}")
+  
+  table_prop = dbutils.widgets.get('table_prop')
+  logger.info(f"Table properties: {table_prop}")
+
+  keyVaultName = os.getenv("secretScope")
+  logger.info(f"Keyvault name: {keyVaultName}")
+
+  
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended reading variables from widgets')
+
+
+logger.info('Started deriving parameters from widgets parameters')
+try:
+
+  propDict = json.loads(table_prop)
+  # logger.info(f'Parsed table properties: {propDict}')
+
+
+  tgt_tbl_name = ''
+  if 'TGT_TBL' in propDict.keys():
+    tgt_tbl_name = propDict['TGT_TBL'].lower()
+    logger.info(f"Target table: {tgt_tbl_name}")
+
+  encr_dict = ''
+  if 'ENCR_DICT' in propDict.keys():
+    encr_dict = propDict['ENCR_DICT']
+    logger.info(f"ENCR_DICT: {encr_dict}")
+
+  region = ''
+  if 'Region' in propDict.keys():
+    region = propDict['Region']
+    logger.info(f"Streaming region: {region}")
+
+    if region.lower() == 'west':
+      ehNamespace_eventhub = os.getenv("tmt_ehNamespace_west")
+      ehKey_vault = os.getenv("tmt_ehKey_vault_west")
+
+    elif region.lower() == 'east':
+      ehNamespace_eventhub = os.getenv("tmt_ehNamespace_east")
+      ehKey_vault = os.getenv("tmt_ehKey_vault_east") 
+  
+  hist_load_type = ''
+  if 'HIST_LOAD_TYPE' in json.loads(job_type).keys():
+    hist_load_type =  json.loads(job_type)['HIST_LOAD_TYPE']
+    logger.info(f"hist_load_type: {hist_load_type}")
+
+  src_eff_start_date_col = ''
+  if 'SRC_EFF_START_DATE' in propDict.keys():
+    src_eff_start_date_col =  propDict['SRC_EFF_START_DATE']
+    logger.info(f"SRC_EFF_START_DATE: {src_eff_start_date_col}")
+
+  zorder_columns = ''
+  if 'Z_ORDER_COLUMNS' in propDict.keys():
+    zorder_columns = propDict['Z_ORDER_COLUMNS']
+    logger.info(f"Z-order columns: {zorder_columns}")
+
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended deriving parameters from widgets parameters')
+
+
+try:
+  # Raw Archive Path
+  current_date = datetime.now().date()
+  current_time = datetime.now().strftime('%Y-%m-%d/%H:%M:%S')
+  print(current_date)
+  print(current_time) 
+
+   # Target Table Path
+  tgt_tbl_path_list = [tgt_path]
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[0])
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[1])
+  tgt_tbl_path_temp = "/".join(tgt_tbl_path_list).lower()
+  tgt_tbl_path = f"{adlsRootPath}{tgt_tbl_path_temp}"
+  logger.info(f"Target table path: {tgt_tbl_path}")
+
+  checkpointLocation = tgt_tbl_path.replace("/processed/","/checkpoint/")
+  logger.info(f"Check point table path: {checkpointLocation}")
+
+  tgt_schema_path = tgt_tbl_path.replace("/processed/","/temp/")
+  logger.info(f"Schema file path: {tgt_schema_path}")
+
+  checkpointLocation_schema = tgt_tbl_path.replace("/processed/","/checkpoint_schema/")
+  logger.info(f"Schema check point path: {checkpointLocation_schema}")
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+
+
+def consumeEventhubMessages(ehNamespace_eventhub,ehKey_vault):
+
+  secretScope = os.getenv("secretScope")
+ 
+  topic =  os.getenv("tmt_topic")
+  kafkaStartingOffsets = "earliest"
+  kafkaMaxOffsetsPerTrigger = "1000000"
+  kafkaMinPartitions = "8"
+  processingTime = "3 seconds"
+  repartitionNumber = "10"
+  landingFileFormat = "text"
+  partitioncol = "type"
+  saslmechanism = "PLAIN"
+  securityprotocol = "SASL_SSL"
+  ehNamespace = ehNamespace_eventhub
+  ehAccessPolicyName =  os.getenv("tmt_ehAccessPolicyName")
+  ehKey = dbutils.secrets.get(secretScope,ehKey_vault)
+  port = os.getenv("tmt_port")
+
+
+  bootstrapServers = ehNamespace + ".servicebus.windows.net:" + port
+  ehSasl = "kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required username='$ConnectionString' password='Endpoint=sb://" + ehNamespace + ".servicebus.windows.net;SharedAccessKeyName=" + ehAccessPolicyName + ";SharedAccessKey="+ehKey+"';"
+
+  print("topic:",topic)
+
+  sourceDF = spark.readStream\
+    .format("kafka")\
+    .option("subscribe", topic) \
+    .option("kafka.bootstrap.servers",bootstrapServers)\
+    .option("startingOffsets",kafkaStartingOffsets)\
+    .option("maxOffsetsPerTrigger",kafkaMaxOffsetsPerTrigger)\
+    .option("kafka.sasl.mechanism", saslmechanism)\
+    .option("kafka.security.protocol", securityprotocol)\
+    .option("kafka.sasl.jaas.config", ehSasl)\
+    .option("kafka.request.timeout.ms", "100000")\
+    .option("kafka.session.timeout.ms", "60000")\
+    .option("failOnDataLoss", "false")\
+    .option("kafka.group.id", "ea-craig-test")\
+    .load()\
+    .withColumn('value', f.decode(f.col('value'),'utf-8'))
+
+  return sourceDF
+
+
+logger.info('Consuming messages from event hub instants')
+try:
+  sourceDF = consumeEventhubMessages(ehNamespace_eventhub,ehKey_vault)
+  sourceDF_lim = sourceDF.limit(1).selectExpr("CAST(value AS STRING)")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Consuming messages from event hub instants have done')
+
+
+logger.info('Loading consumed messages into ADLS location')
+try:
+  df_schema = sourceDF_lim.writeStream.format("json").option("checkpointLocation", checkpointLocation_schema).trigger(availableNow=True).start(tgt_schema_path)
+
+  time.sleep(60)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Loading consumed messages into ADLS location has done')
+
+
+logger.info('Defining schema from input stream')
+try:
+ 
+  json_schema_src = spark.read.option("multiLine", 'true').json(tgt_schema_path)
+  json_schema = (json_schema_src[['value']]).collect()[0][0].replace("'{","{").replace("}'","}")
+  propDict_schema = json.loads(json_schema)
+
+  schema_lst = []
+  for i in propDict_schema.keys():
+    schema_lst.append(i)
+
+  schema = StructType()
+  for col in schema_lst:
+    schema = schema.add(col, StringType(), True)
+
+  logger.info(f"Schema: {schema}")
+
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Defining schema from input stream has completed')
+
+
+logger.info('Data transformation started')
+try:
+  df_src = sourceDF.withColumn("value", f.from_json(f.col("value"), schema))\
+          .select(f.col('key'),f.col('value.*'),f.col('topic'),f.col('partition'),f.col('offset'),f.col('timestamp'),f.col('timestampType')) \
+          .withColumn('region',f.lit(region))\
+          .withColumn(src_eff_start_date_col,f.to_timestamp(f.col(src_eff_start_date_col)))\
+          .withColumn('etl_load_dt',f.current_date())\
+          .withColumn('etl_load_ts',f.current_timestamp())
+
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Data transformation completed')
+
+logger.info('Started encrypting PII columns')
+try:
+  df_src.createOrReplaceTempView('df_src_vw')
+  encr_col_list = df_src.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col = ','.join(final_col)
+  logger.info(f'Encryption columns: {encr_dict.keys()}')
+  encr_qry = f"SELECT {select_col} FROM df_src_vw"
+  logger.info(f'Encryption query: {encr_qry}')
+  df_src = spark.sql(encr_qry)
+  logger.info('Creating parquet dataframe')
+  df_src = df_src.select([f.col(col).alias(col.replace(' ','_')) for col in df_src.columns])
+  
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended encrypting PII columns')
+
+logger.info('Ingesting streaming data')
+try:
+  if 'event_hub_ingestion' in src_system.lower():
+    df_src.writeStream\
+    .outputMode("append")\
+    .option("checkpointLocation", checkpointLocation)\
+    .format("delta")\
+    .partitionBy("etl_load_dt")\
+    .trigger(availableNow=True)\
+    .start(tgt_tbl_path)
+    
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ingesting streaming data done')
+
+logger.info('Started optimizing table')
+try:
+  optQuery = f"OPTIMIZE {tgt_tbl_name} ZORDER BY {zorder_columns}"
+  logger.info(f"{optQuery}")
+  spark.sql(optQuery)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended optimizing table')
+
+dbutils.notebook.exit('note book completed')
