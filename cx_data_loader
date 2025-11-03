@@ -1,0 +1,360 @@
+%run  ./common/adls_config 
+
+  %run ./common/Logging_DPI
+from datetime import datetime
+import pyspark.sql.functions as f
+from pyspark.sql.window import Window
+import sys
+import os
+import logging
+import json
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+
+  %scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+  runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+  # Configuring the properties of logging
+pipelineName = 'dnss_cx_recording_data_loader'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+
+  import logging
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+try:
+  jobType = dbutils.widgets.get('job_type')
+  logger.info(f"Job Type: {jobType}")
+  
+  sourceSystem = dbutils.widgets.get('src_system')
+  logger.info(f"Source system: {sourceSystem}")
+  
+  sourceTableName = dbutils.widgets.get('src_tbl_name')
+  logger.info(f"Source table: {sourceTableName}")
+  
+  file_name = dbutils.widgets.get('file_name')
+  logger.info(f"File name: {file_name}")
+  
+  sourcePath = dbutils.widgets.get('source_path')
+  logger.info(f"Source path: {sourcePath}")
+  
+  targetPath = dbutils.widgets.get('tgt_path')
+  logger.info(f"Target path: {targetPath}")
+  
+  tableProp = dbutils.widgets.get('table_prop')
+  logger.info(f"Table properties: {tableProp}")
+
+  keyVaultName = dbutils.widgets.get('keyvault_name')
+  logger.info(f"Keyvault name: {keyVaultName}")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+  try:
+
+  propDict = json.loads(tableProp)
+  logger.info(f"Table properties dictionary: {tableProp}")
+
+
+  sourceType = propDict['SourceType']
+  logger.info(f"Source type: {sourceType}")
+  if 'table' in sourceType.lower():
+    if 'table_format' in propDict.keys():
+      tableFormat = propDict['table_format']
+      logger.info(f"Source table format: {tableFormat}")
+    
+    isSparkTable = False
+    if 'is_spark_table' in propDict.keys():
+      isSparkTable = True if propDict['is_spark_table'] == '1' else False
+      logger.info(f"Is source table in spark: {isSparkTable}")
+
+    tableOptions = {}
+    if 'table_options' in propDict.keys():
+      tableOptions = propDict['table_options']
+      logger.info(f"Source table options: {tableOptions}")
+      password = dbutils.secrets.get(keyVaultName,tableOptions['password'])
+      tableOptions.update({"password": password})
+      logger.info(f"Updated password from key vault secret")
+    
+    filterColumn = ''
+    if 'filter_column' in propDict.keys():
+      filterColumn = propDict['filter_column']
+      logger.info(f"Source filter column: {filterColumn}")
+
+    primaryKey = ''
+    if 'primary_key' in propDict.keys():
+      primaryKey = propDict['primary_key']
+      logger.info(f"Primary key column: {primaryKey}")
+  
+  targetTableName = propDict['TGT_TBL']
+  logger.info(f"Target table name: {targetTableName}")
+
+  encr_dict = {}
+  if 'ENCR_DICT' in propDict.keys():
+    encr_dict = propDict['ENCR_DICT']
+    logger.info(f"Encryption dictionary: {encr_dict}")
+
+  zOrderColumnsList = []
+  if 'zOrderColumns' in propDict.keys():
+    zOrderColumnsList = propDict['zOrderColumns']
+    logger.info(f"Zorder columns: {zOrderColumnsList}")
+  SQL_QUERY_PATH =[]  
+  if 'SQL_QUERY_PATH' in propDict.keys():
+    SQL_QUERY_PATH = propDict['SQL_QUERY_PATH']  
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f'Failed: {e}')
+
+
+    try:
+  current_date = datetime.now().date()
+  current_time = datetime.now().strftime('%Y-%m-%d/%H:%M:%S')
+
+  # ADLS base path
+  adlsBasePath = adlsRootPath
+  logger.info(f"ADLS base path: {adlsBasePath}")
+
+  # Raw archive path
+  tgt_archive_path_list = targetPath.split('/')[:-1]
+  tgt_archive_path_list.append('raw')
+  tgt_archive_path_list.append(targetTableName.split('.')[0])
+  tgt_archive_path_list.append(targetTableName.split('.')[1])
+  tgt_archive_path_list.append(str(current_time))
+  tgt_archive_path_temp = "/".join(tgt_archive_path_list)
+  tgt_archive_path = tgt_archive_path_temp.lower()
+  raw_archive_path = f"{adlsRootPath}{tgt_archive_path}"
+  logger.info(f"Raw archive path: {raw_archive_path}")
+
+  # Target table path
+  tgt_tbl_path_list = [targetPath]
+  tgt_tbl_path_list.append(targetTableName.split('.')[0])
+  tgt_tbl_path_list.append(targetTableName.split('.')[1])
+  tgt_tbl_path_temp = "/".join(tgt_tbl_path_list).lower()
+  tgt_tbl_path = f"{adlsRootPath}{tgt_tbl_path_temp}"
+  logger.info(f"Target table path: {tgt_tbl_path}")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+
+try:
+  source_name = targetTableName
+  raw_cnt = 'NA'
+  src_filter_cnt = 'NA'
+  dedup_cnt = 'NA'
+  snapshot_insert_cnt = 'NA'
+  hist_insert_cnt = 'NA'
+  hist_update_cnt = 'NA'
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+logger.info('Started reading DNSS PrES table data')
+try:
+  logger.info(f'Reading data from table {sourceTableName}')
+
+  logger.info(f'Getting max created date')
+  # Get MAX Date from target DPI Table
+  maxDateQuery = f"SELECT MAX({filterColumn}) FROM {targetTableName}"
+  logger.info(f'{maxDateQuery}')
+  maxDate = spark.sql(maxDateQuery).collect()[0][0]
+  logger.info(f'Max created date: {maxDate}')
+
+  # Frame source query
+  logger.info(f'Getting source query')
+  sourceQuery = ''
+  if targetTableName.lower() == 'pres_db.dnss_non_customer_consent':
+    pres_decryption_key = dbutils.secrets.get(keyVaultName,'pres-decryption-key')
+    Pres_schema = os.environ.get('pres_schema')
+    password = dbutils.secrets.get(keyVaultName,'pres-password')
+    tableOptions = {
+      "driver" : os.environ.get('press_driver'), 
+      "url" :  os.environ.get('press_url'),
+      "user" : os.environ.get('press_user') ,
+      "password": password
+    }
+    #filepath = f"abfss://analytics@{storageName}.dfs.core.windows.net/dnss/query/DNSS_non_customer_consent_load.sql"
+    if maxDate is None:
+      #sourceQuery = dbutils.fs.head(filepath)
+      sourceQuery = dbutils.fs.head(SQL_QUERY_PATH)
+      sourceQuery = sourceQuery.replace('decryption_key',pres_decryption_key)
+      sourceQuery = sourceQuery.replace('Pres_schema',Pres_schema)
+      print(sourceQuery)
+    else:
+      #sourceQuery = dbutils.fs.head(filepath)
+      sourceQuery = dbutils.fs.head(SQL_QUERY_PATH)
+      sourceQuery = sourceQuery.replace('decryption_key',pres_decryption_key)
+      sourceQuery = sourceQuery.replace('Pres_schema',Pres_schema)
+      sourceQuery = f"{sourceQuery} WHERE {filterColumn} > '{maxDate}'"
+      print(sourceQuery)
+  elif targetTableName.lower() == 'pres_db.dnss_authorized_agent_details':
+    pres_decryption_key = dbutils.secrets.get(keyVaultName,'pres-decryption-key')
+    Pres_schema = os.environ.get('presq1_schema')
+    #Pres_schema = 'qpres01'
+    password = dbutils.secrets.get(keyVaultName,'pres-password-q01')
+    tableOptions = {
+      "driver" : os.environ.get('pressq1_driver'), 
+      "url" :  os.environ.get('pressq1_url'),
+      "user" : os.environ.get('pressq1_user') ,
+      "password": password
+    }  
+    #filepath = f"abfss://analytics@{storageName}.dfs.core.windows.net/dnss/query/DNSS_non_customer_consent_load.sql"
+    if maxDate is None:
+      #sourceQuery = dbutils.fs.head(filepath)
+      sourceQuery = dbutils.fs.head(SQL_QUERY_PATH)
+      sourceQuery = sourceQuery.replace('decryption_key',pres_decryption_key)
+      sourceQuery = sourceQuery.replace('Pres_schema',Pres_schema)
+      print(sourceQuery)
+    else:
+      #sourceQuery = dbutils.fs.head(filepath)
+      sourceQuery = dbutils.fs.head(SQL_QUERY_PATH)
+      sourceQuery = sourceQuery.replace('decryption_key',pres_decryption_key)
+      sourceQuery = sourceQuery.replace('Pres_schema',Pres_schema)
+      sourceQuery = f"{sourceQuery} WHERE {filterColumn} > '{maxDate}'"
+      print(sourceQuery)
+  else:
+    if maxDate is None:
+      sourceQuery = f'SELECT * FROM {sourceTableName}'
+    else:
+      sourceQuery = f"SELECT * FROM {sourceTableName} WHERE {filterColumn} >= '{maxDate}'"
+  logger.info(f'Source query: {sourceQuery}')
+
+  # Read table data
+  if isSparkTable:
+    dfSource = spark.sql(sourceQuery)
+  else:
+    dfSource = spark.read.format(tableFormat) \
+                        .option('dbtable',f'({sourceQuery}) tbl') \
+                        .options(**tableOptions) \
+                        .load()
+  logger.info('Read data into a dataframe')
+
+  # Add ETL columns
+  logger.info('Adding ETL columns')
+  dfSource = dfSource.withColumn('load_dt',f.current_date()) \
+                  .withColumn('load_ts',f.current_timestamp())
+  
+  logger.info('Completed reading')
+  raw_cnt = dfSource.cache().count()
+  logger.info(f'Count of data read: {raw_cnt}')
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended reading DNSS PrES table data')
+
+
+  if raw_cnt == 0:
+  if maxDate is not None:
+    errorMsg = f"No data in source table for {filterColumn} > '{maxDate}'"
+  else:
+    errorMsg = "No data in source table"
+  dbutils.notebook.exit("No source data available")
+
+  
+logger.info('Started encrypting PII columns')
+try:
+  dfSource.createOrReplaceTempView('df_src_vw')
+  encr_col_list = dfSource.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col = ','.join(final_col)
+  logger.info(f'Encryption columns: {encr_dict.keys()}')
+  encr_qry = f"SELECT {select_col} FROM df_src_vw"
+  logger.info(f'Encryption query: {encr_qry}')
+  df_src = spark.sql(encr_qry)
+  logger.info('Creating parquet dataframe')
+  df_src = df_src.select([f.col(col).alias(col.replace(' ','_')) for col in df_src.columns])
+  df_src.cache().write.format('parquet') \
+                      .mode('overwrite') \
+                      .save(raw_archive_path)
+  logger.info(f'Stored at raw archive path: {raw_archive_path}')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended encrypting PII columns')
+
+  logger.info('Started loading data')
+try:
+  logger.info('Started writing to main table')
+  logger.info(f'Writing data to location: {tgt_tbl_path}')
+  df_src.write.format('delta') \
+              .mode('append') \
+              .save(tgt_tbl_path)
+  logger.info('Stored data in main table')
+  logger.info('Ended writing to main table')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended loading data')
+
+  logger.info('Started optimizing table')
+try:
+  # Drop existing indexes
+  dropIndexesQuery = f"DROP BLOOMFILTER INDEX ON {targetTableName}"
+  logger.info(f'Drop existing indexes: {dropIndexesQuery}')
+  spark.sql(dropIndexesQuery)
+  logger.info('Dropped existing indexes')
+
+  # Drop existing indexes
+  createIndexesQuery = f"""CREATE BLOOMFILTER INDEX
+  ON {targetTableName}
+  FOR COLUMNS({primaryKey}
+  OPTIONS (fpp=0.1, numItems=50000000));
+  """
+  logger.info(f'Creating bloomfilter index on : {primaryKey}')
+  logger.info(f'{createIndexesQuery}')
+  spark.sql(createIndexesQuery)
+  logger.info('Created indexes successfully')
+
+  # Optimize table with zOrder
+  if len(zOrderColumnsList) == 0:
+    optQuery = f'OPTIMIZE {targetTableName}'
+  else:
+    zOrderColumns = ",".join(zOrderColumnsList)
+    optQuery = f'OPTIMIZE {targetTableName} ZORDER BY {zOrderColumns}'
+  logger.info(f'Optimize query: {optQuery}')
+  spark.sql(optQuery)
+  logger.info('Optimized')
+  
+  # Vacuum
+  vcmQuery = f'VACUUM {targetTableName} RETAIN 26280 HOURS'
+  logger.info(f'Vacuum query: {vcmQuery}')
+  logger.info('Vacuumed')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended optimizing table')
+
+  try:
+  audit_insert_qry_str = '''
+                            insert into validation.dpi_genius_audit
+                            select {},{},{},{},{},{},{},current_timestamp(),{}
+                         '''.format(repr(source_name), \
+                                    repr(raw_cnt), \
+                                    repr(src_filter_cnt), \
+                                    repr(dedup_cnt), \
+                                    repr(snapshot_insert_cnt), \
+                                    repr(hist_insert_cnt), \
+                                    repr(hist_update_cnt), \
+                                    repr(str(current_date))
+                          )
+  print('Audit table insert query:',audit_insert_qry_str)
+  spark.sql(audit_insert_qry_str)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+spark.catalog.clearCache()
+dbutils.notebook.exit('Ended successfully')
