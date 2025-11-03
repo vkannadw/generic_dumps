@@ -1,0 +1,162 @@
+
+%run ../common/Logging_DPI
+
+import json
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from delta.tables import *
+from pyspark.sql import Row
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pyspark.sql.window import Window
+import logging
+import os
+
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'historical_load_smith_micro'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+# Deduplicate Conditions
+key_column_list = [f.col("IMEI"),f.col("MSISDN"),f.col("Email_Id"),f.col("Consent_Set_Date").cast('date')]
+src_order_by_condn =  ((f.col('Consent_Set_Date').desc()))
+
+# # ETL Conditions
+partitionBy = [f.col("IMEI"),f.col("MSISDN"),f.col("Email_Id")]
+orderBy = ((f.col('Consent_Set_Date').desc()))
+
+encr_dict = {"Email_Id":"volt.eKMESencrypt(Email_Id,'email')"}
+
+env = os.environ.get('ENV')
+one_time_load = {
+    'family_mode': {'tgt_tbl_name' : 'mojio.sync_up_drive_legacy_hist','file_name' : 'SyncUpDriveLegacy_202201_202306.csv'},
+    'family_where':{'tgt_tbl_name' : 'mojio.metro_smart_ride_hist','file_name' : 'MetroSmartRide_202201_202306.csv'}
+}
+
+for capital in one_time_load.values():
+  tgt_tbl_name = capital['tgt_tbl_name']
+  print(tgt_tbl_name)
+  file_name = capital['file_name']
+  data_base = tgt_tbl_name.split('.')[0]
+  Table = tgt_tbl_name.split('.')[1]
+  folder = "_".join(Table.split('_')[:-1])
+  specification = tgt_tbl_name.split('.')[0]
+  logger.info(f'Specification,{specification}')
+  logger.info(f'Main folder name,{folder}')
+  logger.info(f'file_name,{file_name}')
+
+
+  df_raw = spark.read.format('csv') \
+                  .option('delimiter',',') \
+                  .option('header','true') \
+                  .load(f'abfss://analytics@{env}edsdpiwu2adls1.dfs.core.windows.net/spi_pad/landing/{specification}/{folder}/{file_name}')
+
+  
+  
+  df_tgt_hist = spark.sql(f"SELECT * FROM {tgt_tbl_name} where etl_action_cd = 'I'")
+
+  df_src = spark.read.format('csv') \
+                  .option('delimiter',',') \
+                  .option('header','true') \
+                  .load(f'abfss://analytics@{env}edsdpiwu2adls1.dfs.core.windows.net/spi_pad/landing/{specification}/{folder}/{file_name}') \
+                  .withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0]) \
+                  .filter(f.col("file_name").endswith(".csv"))\
+                  .dropDuplicates()
+
+  print("raw_count",df_raw.count())
+
+  if 'sync_up_drive_legacy' in tgt_tbl_name.lower():
+    df_src = df_src.withColumn('Brand', f.lit("Magenta"))\
+                    .withColumn('Channel_ID',f.lit(None).cast('string'))\
+                    .withColumn('App_Name',f.lit("Sync Up Drive Legacy")) \
+                    .withColumn('Consent_Value',f.lit("Opt-In"))\
+                    .withColumn("Consent_Set_Date",f.to_timestamp(f.col("Consent_Set_Date")))
+
+  elif 'metro_smart_ride' in tgt_tbl_name.lower():
+    df_src = df_src.withColumn('Brand', f.lit("Metro"))\
+                    .withColumn('Channel_ID',f.lit(None).cast('string'))\
+                    .withColumn('App_Name',f.lit("MetroSmartRide")) \
+                    .withColumn('Consent_Value',f.lit("Opt-In")) \
+                    .withColumn("Consent_Set_Date",f.to_timestamp(f.col("Consent_Set_Date")))
+
+
+  df_src_final = df_src.na.fill({"MSISDN": '',"Email_Id": ''})\
+                  .withColumn('Consent_Set_Date', f.col('Consent_Set_Date') + f.expr("INTERVAL -8 HOURS") )\
+                  .withColumn("MSISDN",f.regexp_replace("MSISDN", "[^0-9]+", ""))\
+                  .withColumn("ll_date",f.col("Consent_Set_Date").cast('date')) \
+                  .withColumn('ll_dat_rnk',f.row_number() \
+                                           .over(Window.partitionBy(*key_column_list) \
+                                                      .orderBy(src_order_by_condn))) \
+                  .filter(f.col("ll_dat_rnk" )== 1) \
+                  .drop('ll_date','ll_dat_rnk') \
+                  .withColumn('rnk',f.row_number() \
+                                    .over(Window.partitionBy(*partitionBy) \
+                                                .orderBy(orderBy))) \
+                  .withColumn("etl_action_cd",f.when(f.col("rnk") == 1, \
+                                                        f.lit("I")) \
+                                                .otherwise(f.lit("D"))) \
+                  .withColumn("CURR_IND",f.when(f.col("rnk") == 1, \
+                                                      f.lit("Y")) \
+                                                .otherwise(f.lit("N"))) \
+                  .orderBy("rnk") \
+                  .withColumn("lag",f.lag("Consent_Set_Date",1) \
+                                                          .over(Window.partitionBy(*partitionBy) \
+                                                            .orderBy(orderBy)))\
+                  .withColumn("consent_start_date", f.col("Consent_Set_Date").cast('date'))\
+                  .withColumn("consent_end_date",\
+                                        f.when(f.col("Consent_Set_Date").cast('date') < f.col("lag").cast('date'),\
+                                        f.col("lag").cast('date'))\
+                                        .otherwise(f.lit(None).cast('date'))) \
+                  .withColumn("lead_consent_end",f.lead("consent_end_date",1) \
+                                                  .over(Window.partitionBy(*partitionBy) \
+                                                              .orderBy(orderBy))) \
+                  .withColumn("effective_start_dt",f.when(f.col("rnk") == 1, \
+                                                                f.lit(f.current_date())) \
+                                                                .otherwise(f.col('Consent_Set_Date').cast('date'))) \
+                  .withColumn("effective_start_dt",f.when(f.col("lead_consent_end").isNull(),\
+                                                                f.col("effective_start_dt"))\
+                                                                .otherwise(f.col('lead_consent_end').cast('date')))\
+                  .withColumn("effective_end_dt",f.when(f.col("consent_end_date").isNull(),\
+                                                                f.lit(f.current_date()))\
+                                                                .otherwise(f.col('consent_end_date').cast('date')))\
+                  .withColumn("effective_end_dt",f.when(f.col("etl_action_cd") != "I",\
+                                                            f.col("effective_end_dt"))\
+                                                          .otherwise(f.lit(None).cast('date')))\
+                  .withColumn("etl_create_ts",f.lit(f.current_timestamp())) \
+                  .withColumn("etl_change_ts",f.lit(f.current_timestamp())) \
+                  .drop("rnk","lag",'lead_consent_end')\
+                  .select(*[df_tgt_hist.columns])
+
+  print("Final_insert_count",df_src_final.count())
+
+  df_src_final.createOrReplaceTempView('df_src_vw')
+  encr_col_list = df_src_final.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col = ','.join(final_col)
+  logger.info(f'Encryption columns: {encr_dict.keys()}')
+  encr_qry = f"SELECT {select_col} FROM df_src_vw"
+  logger.info(f'Encryption query: {encr_qry}')
+  df_src_final = spark.sql(encr_qry)
+
+  df_src_final.write.format("delta").mode('overwrite').save(f'abfss://analytics@{env}edsdpiwu2adls1.dfs.core.windows.net/spi_pad/processed/{data_base}/{Table}')
+  print("--------------------------")
+  
