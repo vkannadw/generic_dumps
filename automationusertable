@@ -1,0 +1,262 @@
+%run ../common/adls_config
+
+%run ../common/Logging_DPI
+
+
+import json
+import requests
+import sys
+import time
+import logging
+import os
+import smtplib
+import pytz
+from email.mime.text import MIMEText
+from datetime import datetime
+from pytz import timezone
+from pyspark.sql import functions as f
+from pyspark.sql.types import *
+
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'generic_api_data_loader'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+logger.info('Started reading variables from widgets')
+try:
+
+  env = os.getenv("ENV")
+  logger.info(f"Environment name: {env}")
+
+  email_server = os.getenv('smtp_email_server')
+  logger.info(f"email_server name: {email_server}")
+
+  email_sender = os.getenv('ebr_dpi_sender')
+  logger.info(f"email sender name: {email_sender}")
+
+  job_type = dbutils.widgets.get('job_type')
+  logger.info(f"Job Type: {job_type}")
+
+  src_system = dbutils.widgets.get('src_system')
+  logger.info(f"Source system: {src_system}")
+
+  src_tbl_name = dbutils.widgets.get('src_tbl_name')
+  logger.info(f"Source table: {src_tbl_name}")
+
+
+  source_path = dbutils.widgets.get('source_path')
+  logger.info(f"Source path: {source_path}")
+  
+  tgt_path = dbutils.widgets.get('tgt_path')
+  logger.info(f"Target path: {tgt_path}")
+  
+  table_prop = dbutils.widgets.get('table_prop')
+  logger.info(f"Table properties: {table_prop}")
+
+  src_type = json.loads(table_prop)['SourceType'].upper()
+  logger.info(f"src_type: {src_type}")
+
+  tgt_table = json.loads(table_prop)['TargetTable']
+  logger.info(f"tgt_table: {tgt_table}")
+  
+  file_name = json.loads(table_prop)['FileName']
+  logger.info(f"File name: {file_name}")
+
+  cc_user = json.loads(table_prop)['UserEmail']
+  logger.info(f"User name: {cc_user}")
+
+  print("""""""""""""""""""""""""""""""""""""""""""""""""")
+  
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended reading variables from widgets')
+
+
+logger.info('Defining paths')
+try:
+  tgt_tbl_path_list = [tgt_path]
+  tgt_tbl_path_list.append(tgt_table.split('.')[0])
+  tgt_tbl_path_list.append(tgt_table.split('.')[1])
+  tgt_tbl_path_temp = "/".join(tgt_tbl_path_list).lower()
+  tgt_tbl_path = f"{adlsRootPath}{tgt_tbl_path_temp}"
+  tgt_path = tgt_tbl_path
+  logger.info(f"Target table path: {tgt_path}")
+
+  src_path = f"{adlsRootPath}{source_path}/{file_name}"
+  src_path = src_path
+  logger.info(f"Source table path: {src_path}")
+
+  temp_path = tgt_path.replace('processed','temp')
+  logger.info(f"Temp table path: {temp_path}")
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+def send_email(subject, body, recipient):
+    # SMTP server configuration
+    smtp_port = 25
+    
+    # Append the predefined email body to the provided body
+    email_body = f"""
+    <h4 style="color:Black">{body}</h4>
+
+    <pre style="font-family:Calibri;font-size:100%">
+    Regards,
+    DPI Team
+    <a href="mailto:.com">Data.com</a>
+    <p>(This is a system generated mail. Reply to <a href="mailto:DataProtect.com">DataProte.com</a> in case of any discrepancy.)</p>
+    </pre>
+    """
+    
+    try:
+        # Compose the email
+        msg = MIMEText(email_body, 'html')
+        msg['Subject'] = subject
+        msg['From'] = "alytics@gmai.com"
+        msg['To'] = recipient
+
+        # Send an email notification
+        with smtplib.SMTP(email_server, smtp_port) as server:
+            server.sendmail(email_sender, recipient.split(','), msg.as_string())
+
+        print("Sending mail success!")
+
+    except Exception as e:
+        raise Exception("Sending mail success!")
+        print('Sending mail failed:', str(e))
+
+logger.info(f"Reading source file data")
+try:
+  df_src = spark.read.format("csv") \
+                .option("header","true") \
+                .load(src_path)
+
+  if 'dpi.users' in tgt_table.lower():
+
+    df_src.createOrReplaceTempView("dpi_users")
+
+    df_src = spark.sql("""SELECT TRIM(INITCAP(name)) AS `name`
+        , TRIM(LOWER(email)) AS `email`
+        , TRIM(UPPER(workstream)) AS `workstream`
+        , TRIM(INITCAP(role)) AS `role`
+        , TRIM(ntid) AS `ntid`
+        , TRIM(Status) AS `status`
+          FROM dpi_users""")
+  
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+logger.info(f"Taking backup for target data base")
+try:
+  if 'dpi.users' in tgt_table.lower():
+    df_init = spark.sql(f'select * from {tgt_table}')
+
+    df_init.cache().write.format('parquet') \
+                            .mode('overwrite') \
+                            .save(temp_path)
+
+    df_init = spark.read.format('parquet').load(temp_path)
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+logger.info(f"Writing data to target data base")
+try:
+    df_src.write\
+        .format("delta")\
+        .mode("overwrite")\
+        .saveAsTable(tgt_table)
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+try:
+  if 'dpi.users' in tgt_table.lower():
+    logger.info(f"Mail alert for addition and deletion")
+    print(";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
+    df_anti_join = df_src.join(df_init, on=['ntid','workstream'], how='left_anti')
+
+    if df_anti_join.count() > 0:
+
+      ntid_list = df_anti_join.select(df_anti_join.ntid).rdd.flatMap(lambda x: x).collect()
+    
+      for ntid_add in list(set(ntid_list)):
+        df_indivi = df_anti_join.filter(df_anti_join.ntid == ntid_add)
+        workstream_list = df_indivi.select(df_indivi.workstream).rdd.flatMap(lambda x: x).collect()
+        recipientEmail = df_indivi.select(df_indivi.email).rdd.flatMap(lambda x: x).collect()[0] + "," + cc_user
+
+        for stream_add in workstream_list:
+          logger.info("addition")
+          logger.info(ntid_add)
+          logger.info(stream_add)
+          logger.info(recipientEmail)
+          custom_body = f"""
+            <pre style="font-family:Calibri;font-size:95%">
+            NT id  {ntid_add} added into work_stream {stream_add}
+            </pre>
+            """
+          send_email(f"NT ID {ntid_add} added into work_stream {stream_add} | [ENV : {env.upper()}]", custom_body, recipientEmail)
+          print(";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
+
+    else:
+      logger.info("No addition")
+      print(";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
+
+    df_anti_join = df_init.join(df_src, on=['ntid','workstream'], how='left_anti')
+
+    if df_anti_join.count() > 0:
+
+        
+      ntid_list = df_anti_join.select(df_anti_join.ntid).rdd.flatMap(lambda x: x).collect()
+    
+      for ntid_del in list(set(ntid_list)):
+        
+        df_indivi = df_anti_join.filter(df_anti_join.ntid == ntid_del)
+        workstream_list = df_indivi.select(df_indivi.workstream).rdd.flatMap(lambda x: x).collect()
+        recipientEmail = df_indivi.select(df_indivi.email).rdd.flatMap(lambda x: x).collect()[0] + "," + cc_user
+
+        for stream_del in workstream_list:
+          logger.info("deletion")
+          logger.info(ntid_del)
+          logger.info(stream_del)
+          logger.info(recipientEmail)
+          custom_body = f"""
+              <pre style="font-family:Calibri;font-size:95%">
+              NT id  {ntid_del} removed from work_stream {stream_del}
+              </pre>
+              """
+          send_email(f"NT ID {ntid_del} removed from work_stream {stream_del} | [ENV : {env.upper()}]", custom_body, recipientEmail)
+          print(";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
+    else:
+      logger.info("No deletion")
+      print(";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;")
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+
+
