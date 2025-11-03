@@ -1,0 +1,573 @@
+%run  ./common/adls_config
+
+%run  ./common/Logging_DPI
+
+import json
+import requests
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from delta.tables import *
+from pyspark.sql import Row
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pyspark.sql.window import Window
+import logging
+import pandas as pd
+# from slack_sdk import WebClient --DPIA-2939
+import os
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'generic_api_data_loader'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+try:
+  secretScope = os.getenv("secretScope")
+  logger.info(f"Secret Scope: {secretScope}")
+
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+try:
+  source_path = dbutils.widgets.get('source_path')
+  logger.info(f"source_path: {source_path}")
+
+  table_prop = dbutils.widgets.get('table_prop')
+  logger.info(f"table_prop: {table_prop}")
+
+  tgt_path = dbutils.widgets.get('tgt_path')
+  logger.info(f"tgt_path: {tgt_path}")
+
+  job_type = dbutils.widgets.get('job_type')
+  logger.info(f"job_type: {job_type}")
+
+  src_system = dbutils.widgets.get('src_system')
+  logger.info(f"src_system: {src_system}")
+
+  file_name = dbutils.widgets.get('file_name')
+  logger.info(f"file_name: {file_name}")
+  
+  src_tbl_name = dbutils.widgets.get('src_tbl_name')
+  logger.info(f"src_tbl_name: {src_tbl_name}")
+
+  tgt_tbl_name = json.loads(table_prop)['tgt_tbl_name']
+  logger.info(f"tgt_tbl_name: {tgt_tbl_name}")
+
+  consent_value = json.loads(table_prop)['consent_value']
+  logger.info(f"consent_value: {consent_value}")
+
+  key_column_list = None
+  if 'KEY_COLUMNS' in table_prop:
+    key_column_list = [x for x in list(json.loads(table_prop)['KEY_COLUMNS']) ]
+    logger.info(f"key_column_list: {key_column_list}")
+
+  hist_load_type = json.loads(job_type)['HIST_LOAD_TYPE']
+  logger.info(f"hist_load_type: {hist_load_type}")
+
+  src_type = json.loads(table_prop)['SourceType'].upper()
+  logger.info(f"src_type: {src_type}")
+
+
+  src_order_by_condn = None
+  src_filter_condn = None
+  ignore_rerun = None
+  src_delim=','
+  src_hdr='TRUE'
+  rec_cnt = 0
+  encr_dict = {}
+  src_part = {}
+
+  if 'SRC_FILTER_CONDTN' in table_prop:
+    src_filter_condn = json.loads(table_prop)['SRC_FILTER_CONDTN']
+    logger.info(f"src_filter_condn: {src_filter_condn}")
+
+  if 'SRC_DELIMITER' in table_prop:
+    src_delim = json.loads(table_prop)['SRC_DELIMITER']
+    logger.info(f"src_delim: {src_delim}")
+
+  if 'SRC_HEADER' in table_prop:
+    src_hdr = json.loads(table_prop)['SRC_HEADER'].upper()
+    logger.info(f"src_hdr: {src_hdr}")
+  
+  if 'SELECT_COLUMNS' in table_prop and len(json.loads(table_prop)['SELECT_COLUMNS']) > 0:
+    select_columns = json.loads(table_prop)['SELECT_COLUMNS']
+    logger.info(f"select_columns: {select_columns}")
+
+  zorder_columns = json.loads(table_prop)['Z_ORDER_COLUMNS']
+  logger.info(f"zorder_columns: {zorder_columns}")
+
+  current_date = str(f.current_date())
+  logger.info(f"current_date: {current_date}")
+
+
+  SRC_EFF_START_DATE=None
+  if 'SRC_EFF_START_DATE' in table_prop:
+    src_eff_start_date_col = json.loads(table_prop)['SRC_EFF_START_DATE']
+    logger.info(f"src_eff_start_date_col: {src_eff_start_date_col}")
+
+    
+  if 'ENCR_DICT' in table_prop:
+    encr_dict = json.loads(table_prop)['ENCR_DICT']
+    logger.info(f"encr_dict: {encr_dict}")
+
+  if 'DE_DUPLICATE_SRC' in table_prop and json.loads(table_prop)['DE_DUPLICATE_SRC'].upper() == 'TRUE':
+    
+    src_order_by_condn =  ((f.col(src_eff_start_date_col).desc()),(f.when(f.col(consent_value) == "Opt-out", 3).when(f.col(consent_value) == "Pending", 2).when(f.col(consent_value) == "Opt-in", 1)).desc())
+    
+    logger.info(f"src_order_by_condn: {src_order_by_condn}")
+    
+  else:
+    src_order_by_condn = []
+  
+  hash_column_list=['hash_key','hash_diff']
+
+  source_name = tgt_tbl_name.upper()
+  src_filter_cnt = ''
+  dedup_cnt = ''
+  snapshot_insert_cnt = ''
+  hist_insert_cnt = ''
+  hist_update_cnt = ''
+  current_date=datetime.now().date()
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  # send_slack_notification(slack_channel_id,str(e),False) --DPIA-2939
+  raise Exception(f"Failed: {e}")
+
+try:
+  # Raw Archive Path
+  tgt_archive_path_list = tgt_path.split('/')[:-1]
+  tgt_archive_path_list.append('raw')
+  tgt_archive_path_list.append(tgt_tbl_name.split('.')[0])
+  tgt_archive_path_list.append(tgt_tbl_name.split('.')[1].split('_hist')[0])
+  tgt_archive_path_list.append(str(f.current_date()))
+  tgt_archive_path_temp = "/".join(tgt_archive_path_list)
+  tgt_archive_path = tgt_archive_path_temp.lower()
+  raw_archive_path = f"{adlsRootPath}{tgt_archive_path}"
+  logger.info(f"Raw archive path: {raw_archive_path}")
+
+  # Target Table Path
+  tgt_tbl_path_list = [tgt_path]
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[0])
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[1])
+  tgt_tbl_path_temp = "/".join(tgt_tbl_path_list).lower()
+  tgt_tbl_path = f"{adlsRootPath}{tgt_tbl_path_temp}"
+  logger.info(f"Target table path: {tgt_tbl_path}")
+  
+  temp_path_list =[]
+  temp_path_list.append('tmp')
+  temp_path_list.append(tgt_tbl_name.split('.')[0])
+  temp_path_list.append(tgt_tbl_name.split('.')[1].split('_hist')[0])
+  temp_path = "/".join(temp_path_list)
+  temp_path = temp_path.lower()
+  temp_path = f"{adlsRootPath}{temp_path}/{src_system}"
+  logger.info(f"temp path: {temp_path}")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  # send_slack_notification(slack_channel_id,str(e),False) --DPIA-2939
+  raise Exception(f"Failed: {e}")
+
+def read_src_data(src_system,source_path,file_name,filter_condn=None,select_columns=None):
+  df_src = spark.read.format('csv').option('delimiter',',').option('header','true').load(f"{adlsRootPath}/{source_path}/{file_name}")\
+               .withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])
+                
+  raw_cnt = str(df_src.count())
+  return df_src
+
+def incr_key_merge_process(df_src,df_tgt,key_column_list,job_type,src_system):
+  global tgt_tbl_name
+ 
+  if 'INCR-KEY-MERGE-LD' in job_type:
+    
+    hist_tbl_clmns = df_tgt.columns
+    src_col_without_audit_list = df_tgt.columns[:-8]
+    
+    
+    df_src_formatted = df_src.toDF(*src_col_without_audit_list)
+    src_col_without_audit_list.remove("file_name")
+
+    diff_column_list = [x for x in src_col_without_audit_list if x not in key_column_list]
+    print("diff_column.................................",diff_column_list)
+    print("key_column_list.................................",key_column_list)
+    
+
+    df_src_hash_val = df_src_formatted.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                                      .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+
+
+    df_tgt_hash_val = df_tgt.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                            .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+
+
+  
+  
+    hist_tbl_clmns.remove("CURR_IND")  
+
+    df_insert_rec = df_src_hash_val.alias('s') \
+                                               .join(df_tgt_hash_val.alias('t'), \
+                                                     [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                     how='left_outer' ) \
+                                               .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                               .withColumn("tgt_CreatedDateTime",f.col("t." + src_eff_start_date_col)) \
+                                               .select(['s.*',"tgt_CreatedDateTime"]) \
+                                               .withColumn('etl_action_cd',f.lit('I')) \
+                                               .withColumn('consent_start_date', f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date"), \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date")) \
+                                                                                  .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                               .withColumn('consent_end_date',f.lit(None).cast('date')) \
+                                               .withColumn('effective_start_dt', f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date"), \
+                                                                                       f.current_date()) \
+                                                                                  .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                               .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                               .withColumn('etl_create_ts',f.current_timestamp()) \
+                                               .withColumn('etl_change_ts',f.current_timestamp()) \
+                                               .drop("tgt_CreatedDateTime") \
+                                               .drop(*hash_column_list) \
+                                                .select(*hist_tbl_clmns)
+
+    logger.info(f"Insert records count: {df_insert_rec.count()}")
+
+    # #             # Identify changes in the existing records
+    df_update_rec = df_src_hash_val.alias('s') \
+                                               .join(df_tgt_hash_val.alias('t'), \
+                                                     [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                     how='inner' ) \
+                                               .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                               .withColumn("src_CreatedDateTime",f.col("s." + src_eff_start_date_col)) \
+                                               .select(['t.*',"src_CreatedDateTime"]) \
+                                               .withColumn('etl_action_cd',f.lit('D')) \
+                                               .withColumn('consent_start_date',f.col('t.consent_start_date')) \
+                                               .withColumn('consent_end_date',f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                    f.col("src_CreatedDateTime").cast("date"), \
+                                                                                    f.lit(None).cast('date')) \
+                                                                               .otherwise(f.col("src_CreatedDateTime").cast("date"))) \
+                                               .withColumn('effective_start_dt',f.col('t.effective_start_dt')) \
+                                               .withColumn('effective_end_dt',f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                    f.col("src_CreatedDateTime").cast("date"), \
+                                                                                    f.current_date()) \
+                                                                               .otherwise(f.col("src_CreatedDateTime").cast("date"))) \
+                                               .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                               .withColumn('etl_change_ts',f.current_timestamp()) \
+                                                .withColumn('consent_end_date',f.when(f.col("consent_start_date").cast("date") == \
+                                                                                    f.col("consent_end_date").cast("date"), \
+                                                                                    f.lit(None).cast('date')) \
+                                                                               .otherwise(f.col("consent_end_date").cast("date"))) \
+                                               .drop("src_CreatedDateTime") \
+                                               .drop(*hash_column_list)\
+                                               .select(*hist_tbl_clmns)
+
+    logger.info(f"Update records count: {df_update_rec.count()}")
+
+    df_final = df_insert_rec.union(df_update_rec)
+    return df_final
+
+def write_tgt_df(df_write,tgt_format,tgt_mode,tgt_location,key_column_list=None):
+  global snapshot_insert_cnt
+  global hist_insert_cnt
+  global hist_update_cnt
+  logger.info("Storing dataframe...")
+  logger.info(f"Format: {tgt_format}")
+  logger.info(f"Mode: {tgt_mode}")
+  if 'append' in tgt_mode:
+    logger.info("Storing fresh data...")
+    df_write.write \
+            .format(tgt_format) \
+            .mode(tgt_mode) \
+            .save(tgt_location)
+  if 'merge' in tgt_mode:
+    
+    df_src_update=df_write.filter("etl_action_cd!='I'")
+    df_src_insert=df_write.filter("etl_action_cd=='I'")
+    
+    merge_condition_str = ' and '.join(['t.'+c+'= s.'+c for c in key_column_list]) 
+    
+    tbl_tgt = DeltaTable.forPath(spark,tgt_location)
+    df_tgt = tbl_tgt.toDF()
+    
+    update_key_list = [c for c in df_tgt.columns if c not in key_column_list]
+    update_val_list = ['s.'+c for c in update_key_list]
+    update_dict = dict(zip(update_key_list,update_val_list))
+
+    insert_key_list = [c for c in df_tgt.columns]
+    insert_val_list = ['s.'+c for c in insert_key_list]
+    insert_dict = dict(zip(insert_key_list,insert_val_list))
+    
+    
+    hist_insert_cnt = str(df_src_insert.count())
+    hist_update_cnt = str(df_src_update.count())
+    snapshot_insert_cnt = hist_insert_cnt
+
+    logger.info(f"Insert count: {hist_insert_cnt}")
+    logger.info(f"Update count: {hist_update_cnt}")
+    
+    if "_hist" in tgt_location:
+      merge_condition_str = merge_condition_str+" and t.etl_action_cd='I'"
+    else:
+      df_src_update = df_src_update.drop('etl_action_cd')
+      df_src_insert = df_src_insert.drop('etl_action_cd')
+    
+    logger.info(f"Updating {df_src_update.count()} records on {tgt_location}")
+    tbl_tgt.alias('t')\
+      .merge(df_src_update.alias('s'),
+            merge_condition_str
+            )\
+      .whenMatchedUpdate(set = update_dict)\
+    .execute()
+  
+    logger.info(f"Inserting {df_src_insert.count()} records on {tgt_location}")
+    df_src_insert.write.format(tgt_format).mode('append').save(tgt_location)
+
+
+
+def src_de_duplicate_process(df,key_column_list,src_order_by_condn,src_system=None):
+  global dedup_cnt, src_tbl_name
+  df_de_duplicate = df.dropDuplicates()
+  logger.info(f"Deduplicating common")
+  df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                           .over(Window.partitionBy(*key_column_list) \
+                                                 .orderBy(*src_order_by_condn))) \
+                                          .filter("rnk=1")\
+                                          .drop("rnk")
+                     
+  dedup_cnt = str(df_unique.count())
+  logger.info(f"Deduplicate count: {dedup_cnt}")
+  return df_unique
+
+
+try:
+  df_src = read_src_data(src_system,source_path,file_name,filter_condn=None,select_columns=None)
+  if 'SMITH_MICRO'in src_system.upper():
+    df_src = df_src.na.fill({"account_msisdn": ''})\
+                          .withColumn("event_date",f.to_timestamp(f.col("event_date")))
+                    
+
+  else:
+    df_col = spark.sql(f"select * from {tgt_tbl_name}")
+    df_col_list = df_col.columns
+    df_col_list = df_col_list[:-8]
+
+    if 'syncup_drive_legacy' in tgt_tbl_name.lower():
+      df_src = df_src.withColumn('Brand', f.lit("Magenta"))\
+                      .withColumn('Channel_ID',f.lit(None).cast('string'))\
+                      .withColumn('App_Name',f.lit("Sync Up Drive Legacy")) \
+                      .withColumn('Consent_Value',f.lit("Opt-In"))\
+                      .withColumn("Consent_Set_Date",f.to_timestamp(f.col("Consent_Set_Date")))
+
+    elif 'metro_smart_ride' in tgt_tbl_name.lower():
+      df_src = df_src.withColumn('Brand', f.lit("Metro"))\
+                      .withColumn('Channel_ID',f.lit(None).cast('string'))\
+                      .withColumn('App_Name',f.lit("MetroSmartRide")) \
+                      .withColumn('Consent_Value',f.lit("Opt-In")) \
+                      .withColumn("Consent_Set_Date",f.to_timestamp(f.col("Consent_Set_Date")))
+
+    df_src = df_src.na.fill({"MSISDN": '',"Email_Id" : ''})\
+                  .withColumn('Consent_Set_Date', f.col('Consent_Set_Date') + f.expr("INTERVAL -8 HOURS") )\
+                  .withColumn("MSISDN",f.regexp_replace("MSISDN", "[^0-9]+", ""))\
+                  .select(*df_col_list)
+                  
+                   
+
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  # send_slack_notification(slack_channel_id,str(e),False) --DPIA-2939
+  raise Exception("Failed:",str(e))
+
+if 'incr-key' in json.loads(job_type)["HIST_LOAD_TYPE"].lower():
+  tgt_col = spark.sql(f"select * from {tgt_tbl_name}").columns[:-9]
+else:
+  tgt_col = spark.sql(f"select * from {tgt_tbl_name}").columns[:-1]
+tgt_col = [i.lower() for i in tgt_col]
+
+
+if 'file' in json.loads(table_prop)['SourceType'].lower():
+  src_col = df_src.columns[:-1]
+else:
+  src_col = df_src.columns
+src_col = [i.lower() for i in src_col]
+
+
+if len(tgt_col) == len(src_col):
+  for idx, x in enumerate(src_col):
+    if x not in tgt_col:
+      raise Exception(f"Column {x} not present in target table")
+    else:
+      if x != tgt_col[idx]:
+        raise Exception(f"Column order missmatch")
+
+  print("We are good with source data")
+else:
+  print("Some column missmatch happened in source and target table")
+  raise Exception(f"Column missmatch")
+
+
+logger.info('Started encrypting PII columns')
+try:
+  df_src.createOrReplaceTempView('df_src_vw')
+  encr_col_list = df_src.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col = ','.join(final_col)
+  logger.info(f'Encryption columns: {encr_dict.keys()}')
+  encr_qry = f"SELECT {select_col} FROM df_src_vw"
+  logger.info(f'Encryption query: {encr_qry}')
+  df_src = spark.sql(encr_qry)
+  logger.info('Creating parquet dataframe')
+  df_src = df_src.select([f.col(col).alias(col.replace(' ','_')) for col in df_src.columns])
+  df_src.cache().write.format('parquet') \
+                      .mode('overwrite') \
+                      .save(temp_path)
+  logger.info(f'Stored at raw archive path: {temp_path}')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended encrypting PII columns')
+
+
+logger.info('Started getting count of source data')
+try:
+  df_sr = spark.read.format('parquet').load(temp_path)
+  src_cnt = df_sr.cache().count()
+  src_filter_cnt = src_cnt
+  logger.info(f"Source data count: {src_filter_cnt}")
+  if src_cnt == 0:
+    raise Exception("Source data count 0. No data in source")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended getting count of source data')
+
+
+logger.info('Started deduplicating source data')
+try:
+  df_src = src_de_duplicate_process(df_sr,key_column_list,src_order_by_condn,src_system)
+      
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended deduplicating source data')
+
+logger.info('Started writing data to main table')
+try:
+  if 'INCR-KEY-MERGE' in hist_load_type.upper():
+
+    df_tgt_hist = spark.sql(f"SELECT * FROM {tgt_tbl_name} where etl_action_cd = 'I'")
+    df_hist_w = incr_key_merge_process(df_src,df_tgt_hist,key_column_list,hist_load_type,src_system)
+    df_hist_w = df_hist_w.withColumn('CURR_IND',f.lit('Y')).select(*[df_tgt_hist.columns])
+    stg_path = f"{tgt_tbl_path.replace('processed','stage')}"
+    logger.info(f"Staging data at: {stg_path}")
+    if 'OPTIN' in src_system.upper():
+      stg_path_optin = f"{tgt_tbl_path.replace('processed','stage')}/{f.current_date()}/{src_system}/optin"
+      df_hist_insert_optin = df_hist_w.filter(f.col("etl_action_cd") == 'D')\
+                              .withColumn("consent_end_date",f.lit(None).cast('date'))\
+                              .withColumn("effective_end_dt",f.col("effective_start_dt")) \
+                                .withColumn("etl_change_ts",f.current_timestamp())\
+                                  .withColumn("consent_value", f.lit("Opt-In"))
+
+      logger.info(f"Opt-In insert count: {df_hist_insert_optin.count()}")
+      df_hist_insert_optin.write.format("parquet").mode("overwrite").save(stg_path_optin)
+      df_hist_insert_opt = spark.read.format("parquet").load(stg_path_optin)
+      df_hist_insert_opt.write.format('delta').mode('append').save(tgt_tbl_path)
+    
+
+    df_hist_w.write.format("parquet").mode("overwrite").save(stg_path)
+    df_hist = spark.read.format("parquet").load(stg_path)
+
+    write_tgt_df(df_write = df_hist,
+                     tgt_format = 'delta',
+                     tgt_mode = 'merge',
+                     tgt_location = tgt_tbl_path,
+                     key_column_list = key_column_list)
+  
+
+    df_stag = spark.read.load(tgt_tbl_path)
+    src_order_condn_active_indi = [src_eff_start_date_col,'etl_action_cd']
+    # src_order_condn.remove('consent_value')
+    # src_order_by_condn.append('etl_action_cd')
+
+    df_stag = df_stag.withColumn('rnk',f.row_number() \
+                                         .over(Window.partitionBy(*key_column_list) \
+                                               .orderBy(*[f.col(c).desc() for c in src_order_condn_active_indi]))) \
+                              .withColumn("CURR_IND",f.when(f.col("rnk") == 1,\
+                                                            f.lit("Y"))\
+                                          .otherwise(f.lit("N")))\
+                                          .drop("rnk").select(*[df_tgt_hist.columns])
+
+    df_stag.write.format("delta").mode('overwrite').save(tgt_tbl_path)
+    logger.info("Stored final dataframe!!!")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended writing to main table')                
+
+
+logger.info('Started optimizing table')
+try:
+  optQuery = f"OPTIMIZE {tgt_tbl_name} ZORDER BY {zorder_columns}"
+  logger.info(f"{optQuery}")
+  spark.sql(optQuery)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended optimizing table')
+
+logger.info('Started deleting temporary path')
+try:
+  logger.info(f"Removing temp path: {temp_path}")
+  dbutils.fs.rm(temp_path,True)
+  logger.info(f"Temp path deleted!!!")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended deleting temporary path')
+
+
+try:
+  audit_insert_qry_str = '''
+                            insert into validation.dpi_genius_audit 
+                            select {},{},{},{},{},{},{},current_timestamp(),{}
+                         '''.format(repr(source_name), \
+                                    repr(raw_cnt), \
+                                    repr(src_filter_cnt), \
+                                    repr(dedup_cnt), \
+                                    repr(snapshot_insert_cnt), \
+                                    repr(hist_insert_cnt), \
+                                    repr(hist_update_cnt), \
+                                    repr(str(current_date))
+                          )
+  logger.info(f"Audit table insert query: {audit_insert_qry_str}")
+  spark.sql(audit_insert_qry_str)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+try:
+  logger.info(f"Ended Job: {runId}")
+  logger.info('Started clearing cache')
+  spark.catalog.clearCache()
+  logger.info('Ended clearing cache')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
