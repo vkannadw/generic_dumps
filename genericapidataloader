@@ -1,0 +1,1070 @@
+%run  ./common/adls_config
+%run  ./common/Logging_DPI
+
+import json
+import requests
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from delta.tables import *
+from pyspark.sql import Row
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pyspark.sql.window import Window
+import logging
+import pandas as pd
+# from slack_sdk import WebClient --DPIA-2939
+import io
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.catalog.clearCache()
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'generic_api_data_loader'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh = logging.StreamHandler(sys.stdout)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+logger.info(f"Started Job: {runId}")
+
+try:
+  secretScope = os.getenv("secretScope")
+  logger.info(f"Secret Scope: {secretScope}")
+
+
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+
+logger.info('Started reading variables from widgets')
+try:
+  job_type = dbutils.widgets.get('job_type')
+  logger.info(f"Job Type: {job_type}")
+  
+  src_system = dbutils.widgets.get('src_system')
+  logger.info(f"Source system: {src_system}")
+  
+  src_tbl_name = dbutils.widgets.get('src_tbl_name')
+  logger.info(f"Source table: {src_tbl_name}")
+  
+  file_name = dbutils.widgets.get('file_name')
+  logger.info(f"File name: {file_name}")
+  
+  source_path = dbutils.widgets.get('source_path')
+  logger.info(f"Source path: {source_path}")
+  
+  tgt_path = dbutils.widgets.get('tgt_path')
+  logger.info(f"Target path: {tgt_path}")
+  
+  table_prop = dbutils.widgets.get('table_prop')
+  logger.info(f"Table properties: {table_prop}")
+
+  keyVaultName = os.getenv("secretScope")
+  logger.info(f"Keyvault name: {keyVaultName}")
+
+  
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended reading variables from widgets')
+
+logger.info('Started deriving parameters from widgets parameters')
+try:
+
+  propDict = json.loads(table_prop)
+  logger.info(f'Parsed table properties: {propDict}')
+
+  tgt_tbl_name = ''
+  if 'TGT_TBL' in propDict.keys():
+    tgt_tbl_name = propDict['TGT_TBL'].lower()
+    logger.info(f"Target table: {tgt_tbl_name}")
+
+  key_column_list = ''
+  if 'key_column_list' in propDict.keys():
+    key_column_list =  propDict['key_column_list']
+    logger.info(f"key_column_list: {key_column_list}")
+
+  encr_dict = ''
+  if 'ENCR_DICT' in propDict.keys():
+    encr_dict = propDict['ENCR_DICT']
+    logger.info(f"ENCR_DICT: {encr_dict}")
+  
+  src_order_by_condn = ''
+  if 'src_order_by_condn' in propDict.keys():
+    src_order_by_condn =  propDict['src_order_by_condn']
+    logger.info(f"src_order_by_condn: {src_order_by_condn}")
+
+  src_filter_condn = ''
+  if 'SRC_FILTER_CONDTN' in propDict.keys():
+    src_filter_condn =  propDict['SRC_FILTER_CONDTN']
+    logger.info(f"SRC_FILTER_CONDTN: {src_filter_condn}")
+  
+  src_eff_start_date_col = ''
+  if 'SRC_EFF_START_DATE' in propDict.keys():
+    src_eff_start_date_col =  propDict['SRC_EFF_START_DATE']
+    logger.info(f"SRC_EFF_START_DATE: {src_eff_start_date_col}")
+
+  zorder_columns = ''
+  if 'zorder_columns' in propDict.keys():
+    zorder_columns = propDict['zorder_columns']
+    logger.info(f"Z-order columns: {zorder_columns}")
+  
+  hist_load_type = ''
+  if 'HIST_LOAD_TYPE' in json.loads(job_type).keys():
+    hist_load_type =  json.loads(job_type)['HIST_LOAD_TYPE']
+    logger.info(f"hist_load_type: {hist_load_type}")
+  
+  hash_column_list = ['hash_key','hash_diff']
+  logger.info(f"hash_column_list: {hash_column_list}")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended deriving parameters from widgets parameters')
+
+
+logger.info('Started initializing audit variables')
+try:
+  source_name = tgt_tbl_name.upper()
+  src_filter_cnt = ''
+  dedup_cnt = ''
+  snapshot_insert_cnt = ''
+  hist_insert_cnt = ''
+  hist_update_cnt = ''
+  current_date = datetime.now().date()
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended initializing audit variables')
+
+
+logger.info('Started deriving ADLS paths')
+try:
+  # Raw Archive Path
+  tgt_archive_path_list = tgt_path.split('/')[:-1]
+  tgt_archive_path_list.append('raw')
+  tgt_archive_path_list.append(tgt_tbl_name.split('.')[0])
+  tgt_archive_path_list.append(tgt_tbl_name.split('.')[1].split('_hist')[0])
+  tgt_archive_path_list.append(str(current_date))
+  tgt_archive_path_temp = "/".join(tgt_archive_path_list)
+  tgt_archive_path = tgt_archive_path_temp.lower()
+  raw_archive_path = f"{adlsRootPath}{tgt_archive_path}"
+  logger.info(f"Raw archive path: {raw_archive_path}")
+
+  # Landing Path
+  landingPath = raw_archive_path.replace("/raw/","/landing/")
+  logger.info(f"Landing path: {landingPath}")
+
+  # Target Table Path
+  tgt_tbl_path_list = [tgt_path]
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[0])
+  tgt_tbl_path_list.append(tgt_tbl_name.split('.')[1])
+  tgt_tbl_path_temp = "/".join(tgt_tbl_path_list).lower()
+  tgt_tbl_path = f"{adlsRootPath}{tgt_tbl_path_temp}"
+  logger.info(f"Target table path: {tgt_tbl_path}")
+  
+  # temp_path_list =[]
+  # temp_path_list.append('tmp')
+  # temp_path_list.append(tgt_tbl_name.split('.')[0])
+  # temp_path_list.append(tgt_tbl_name.split('.')[1].split('_hist')[0])
+  # temp_path = "/".join(temp_path_list)
+  # temp_path = temp_path.lower()
+  # temp_path = f"{adlsRootPath}{temp_path}"
+  # logger.info(f"temp path: {temp_path}")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended deriving ADLS paths')
+
+
+def read_source_data(sourceSystem, targetTable,**table_prop):
+  global secretScope,start_date,end_date
+  
+  if 'THINGS_PLATFORM' in sourceSystem.upper():
+    logger.info("kids_watch")
+    accessTokenApi = ''
+    accessTokenApi = (table_prop)['accessTokenApi']
+    logger.info(f"accessTokenApi : {accessTokenApi}") 
+
+    dataApi = ''
+    dataApi = (table_prop)['dataApi']
+    logger.info(f"dataApi : {dataApi}") 
+
+    clientId = ''
+    clientId = (table_prop)['ClientID']
+    logger.info(f"clientId : {clientId}") 
+
+    clientsecret = ''
+    clientsecret = (table_prop)['ClientSecret']
+    logger.info(f"clientsecret : {clientsecret}") 
+
+    syncUpSubscriptionKey = ''
+    syncUpSubscriptionKey = (table_prop)['subscriptionKey']
+    logger.info(f"clientsecret : {syncUpSubscriptionKey}") 
+
+    grantType = ''
+    grantType = (table_prop)['grantType']
+    logger.info(f"grantType : {grantType}") 
+
+
+    clientId = dbutils.secrets.get(secretScope,clientId)
+    clientsecret = dbutils.secrets.get(secretScope,clientsecret)
+    subscriptionKey = dbutils.secrets.get(secretScope,syncUpSubscriptionKey)
+    scope = f"{clientId}/.default"
+
+    try :
+
+        
+      response = requests.post(url = accessTokenApi, data = {
+        "client_id": clientId,
+        "client_secret": clientsecret,
+        "grant_type": grantType,
+        "scope": scope
+      },timeout=240)
+      accessToken = response.json()['access_token']
+
+      resp = requests.get(url = dataApi,
+                          headers = {
+                            "Authorization": f"{accessToken}",
+                            "x-subscription-key": subscriptionKey
+                          },timeout=120)
+      apiData = resp.content
+    except Exception as e:
+      errorMessage = f"Failed with error: {str(e)}"
+      raise Exception(errorMessage)
+    return apiData
+  
+  elif 'ADOBE_API' in sourceSystem:
+    if 'PAD' in targetTable.upper():
+      accessTokenApi = ""
+      if 'accessTokenApi' in table_prop:
+        accessTokenApi = (table_prop)['accessTokenApi']
+        logger.info(f"accessTokenApi: {accessTokenApi}")  
+
+      dataApi = ""
+      if 'dataApi' in table_prop:
+        dataApi = (table_prop)['dataApi']
+        logger.info(f"dataApi: {dataApi}")
+
+      APIKey = ""
+      if 'APIKey' in table_prop:
+        APIKey = (table_prop)['APIKey']
+        logger.info(f"APIKey: {APIKey}")
+        apiKey = dbutils.secrets.get(secretScope,APIKey)
+
+      OrgID = ""
+      if 'OrgID' in table_prop:
+        OrgID = (table_prop)['OrgID'].lower()
+        logger.info(f"OrgID: {OrgID}")
+        orgId = dbutils.secrets.get(secretScope,OrgID)
+
+      ClientID = ""
+      if 'ClientID' in table_prop:
+        ClientID = (table_prop)['ClientID'].lower()
+        logger.info(f"ClientID: {ClientID}")
+        clientId = dbutils.secrets.get(secretScope,ClientID)
+
+
+      ClientSecret = ""
+      if 'ClientSecret' in table_prop:
+        ClientSecret = (table_prop)['ClientSecret'].lower()
+        logger.info(f"ClientSecret: {ClientSecret}")
+        clientSecret = dbutils.secrets.get(secretScope,ClientSecret)
+
+      JWT = ""
+      if 'JWT' in table_prop:
+        JWT = (table_prop)['JWT'].lower()
+        logger.info(f"JWT: {JWT}")
+        jwtToken = dbutils.secrets.get(secretScope,JWT)
+
+
+      # end_date = datetime.now(timezone.utc)
+      end_date = ""
+      start_date = ""
+      if  'end_date' in table_prop:
+        end_date = (table_prop)['end_date']
+        logger.info(f"end_date: {end_date}")
+        start_date_ref = (table_prop)['start_date_ref']
+        logger.info(f"start_date_ref: {start_date_ref}")
+
+      else:
+        end_date = datetime.now()
+        end_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_date_ref = end_date - timedelta(days = 1)
+        end_date = (end_date.strftime("%Y-%m-%dT%H:%M:%S%Z"))
+        start_date = (start_date_ref.strftime("%Y-%m-%dT%H:%M:%S%Z"))
+        logger.info(f"end_date: {end_date}")    
+        logger.info(f"start_date: {start_date}") 
+   
+      
+      accessTokenApiheaders = {
+        "Content-Type": "application/x-www-form-urlencoded"
+      }
+      accessTokenApiBody = {
+        "client_id": clientId,
+        "client_secret": clientSecret,
+        "jwt_token": jwtToken
+      }
+      try:
+        response = requests.post(
+          url = accessTokenApi,
+          headers = accessTokenApiheaders,
+          data = accessTokenApiBody,
+          timeout=120
+        )
+        if response.status_code == 200:
+          accessToken = response.json()['access_token']
+        else:
+          apiResponse = response.text
+          statusCode = response.status_code
+          raise Exception(f"Failed with status code: {statusCode}. Error: {apiResponse}")
+      except Exception as e:
+        errorMessage = f"Failed with error: {str(e)}"
+        raise Exception(errorMessage)
+
+      dataApiHeaders = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {accessToken}",
+        "x-api-key": apiKey,
+        "x-proxy-global-company-id": orgId
+      }
+      payload = {
+                  "rsid": "tmobusprod",
+                  "globalFilters": [
+                      {
+                          "type": "dateRange",
+                          "dateRange": "2023-05-06T00:00:00.000/2023-05-07T00:00:00.000",
+                          "dateRangeId": "62152123b496a5284ebcd52b"
+                      }
+                  ],
+                  "metricContainer": {
+                      "metrics": [
+                          {
+                              "columnId": "metrics/visits:::0",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_1",
+                                  "0"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::2",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_3",
+                                  "1"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::4",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_5",
+                                  "2"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::6",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_7",
+                                  "3"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::8",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_9",
+                                  "4"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::10",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_11",
+                                  "5"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::12",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_13",
+                                  "6"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::14",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_15",
+                                  "7"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::16",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_17",
+                                  "8"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::18",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_19",
+                                  "9"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::20",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_21",
+                                  "10"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::22",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_23",
+                                  "11"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::24",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_25",
+                                  "12"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::26",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_27",
+                                  "13"
+                              ]
+                          },
+                          {
+                              "columnId": "metrics/visits:::28",
+                              "id": "metrics/visits",
+                              "filters": [
+                                  "STATIC_ROW_COMPONENT_29",
+                                  "14"
+                              ]
+                          }
+                      ],
+                      "metricFilters": [
+                          {
+                              "id": "STATIC_ROW_COMPONENT_1",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e9820f2f7d2d80decdcc"
+                          },
+                          {
+                              "id": "0",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ebea7529975c42be631e"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_3",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e9820f2f7d2d80decdcc"
+                          },
+                          {
+                              "id": "1",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec3f7529975c42be631f"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_5",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e9820f2f7d2d80decdcc"
+                          },
+                          {
+                              "id": "2",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec93c61ddc02df149290"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_7",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d66df59ca65f11b97dbc"
+                          },
+                          {
+                              "id": "3",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ebea7529975c42be631e"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_9",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d66df59ca65f11b97dbc"
+                          },
+                          {
+                              "id": "4",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec3f7529975c42be631f"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_11",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d66df59ca65f11b97dbc"
+                          },
+                          {
+                              "id": "5",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec93c61ddc02df149290"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_13",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d8660d709078a4b406c6"
+                          },
+                          {
+                              "id": "6",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ebea7529975c42be631e"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_15",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d8660d709078a4b406c6"
+                          },
+                          {
+                              "id": "7",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec3f7529975c42be631f"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_17",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7d8660d709078a4b406c6"
+                          },
+                          {
+                              "id": "8",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec93c61ddc02df149290"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_19",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7deb50546560ef5123095"
+                          },
+                          {
+                              "id": "9",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ebea7529975c42be631e"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_21",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7deb50546560ef5123095"
+                          },
+                          {
+                              "id": "10",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec3f7529975c42be631f"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_23",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7deb50546560ef5123095"
+                          },
+                          {
+                              "id": "11",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec93c61ddc02df149290"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_25",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e7cb0f2f7d2d80decdc9"
+                          },
+                          {
+                              "id": "12",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ebea7529975c42be631e"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_27",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e7cb0f2f7d2d80decdc9"
+                          },
+                          {
+                              "id": "13",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec3f7529975c42be631f"
+                          },
+                          {
+                              "id": "STATIC_ROW_COMPONENT_29",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7e7cb0f2f7d2d80decdc9"
+                          },
+                          {
+                              "id": "14",
+                              "type": "segment",
+                              "segmentId": "s300000122_63f7ec93c61ddc02df149290"
+                          }
+                      ]
+                  },
+                  "settings": {
+                      "countRepeatInstances": True,
+                      "includeAnnotations": True
+                  },
+                  "statistics": {
+                      "functions": [
+                          "col-max",
+                          "col-min"
+                      ]
+                  },
+                  "capacityMetadata": {
+                      "associations": [
+                          {
+                              "name": "applicationName",
+                              "value": "Analysis Workspace UI"
+                          }
+                      ]
+                  }
+              }
+      try:
+        response = requests.post(
+          url = dataApi,
+          headers = dataApiHeaders,
+          data = json.dumps(payload),
+          timeout=120
+        )
+        if response.status_code == 200:
+          apiResponse = response.json()
+          logger.info(f"API call successful!!!")
+          logger.info(f"Response from API:")
+          logger.info(f"apiResponse")
+        else:
+          apiResponse = response.content
+          statusCode = response.status_code
+          raise Exception(f"Failed with status code: {statusCode}. Error: {apiResponse}")
+      except Exception as e:
+        errorMessage = f"Failed with error: {str(e)}"
+        raise Exception(errorMessage)
+      
+      return apiResponse
+
+
+def incr_key_merge_process(df_src,df_tgt,key_column_list,job_type,src_system):
+  global tgt_tbl_name
+ 
+  if 'INCR-KEY-MERGE-LD' in job_type:
+    
+    hist_tbl_clmns = df_tgt.columns
+    src_col_without_audit_list = df_tgt.columns[:-8]
+    
+    
+    df_src_formatted = df_src.toDF(*src_col_without_audit_list)
+    # src_col_without_audit_list.remove("file_name")
+
+    diff_column_list = [x for x in src_col_without_audit_list if x not in key_column_list]
+    print("diff_column.................................",diff_column_list)
+    print("key_column_list.................................",key_column_list)
+    
+
+    df_src_hash_val = df_src_formatted.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                                      .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+
+
+    df_tgt_hash_val = df_tgt.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                            .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+
+
+  
+  
+    hist_tbl_clmns.remove("CURR_IND")  
+
+    df_insert_rec = df_src_hash_val.alias('s') \
+                                               .join(df_tgt_hash_val.alias('t'), \
+                                                     [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                     how='left_outer' ) \
+                                               .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                               .withColumn("tgt_CreatedDateTime",f.col("t." + src_eff_start_date_col)) \
+                                               .select(['s.*',"tgt_CreatedDateTime"]) \
+                                               .withColumn('etl_action_cd',f.lit('I')) \
+                                               .withColumn('consent_start_date', f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date"), \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date")) \
+                                                                                  .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                               .withColumn('consent_end_date',f.lit(None).cast('date')) \
+                                               .withColumn('effective_start_dt', f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                       f.col("tgt_CreatedDateTime").cast("date"), \
+                                                                                       f.current_date()) \
+                                                                                  .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                               .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                               .withColumn('etl_create_ts',f.current_timestamp()) \
+                                               .withColumn('etl_change_ts',f.current_timestamp()) \
+                                               .drop("tgt_CreatedDateTime") \
+                                               .drop(*hash_column_list) \
+                                                .select(*hist_tbl_clmns)
+
+    logger.info(f"Insert records count: {df_insert_rec.count()}")
+
+    # #             # Identify changes in the existing records
+    df_update_rec = df_src_hash_val.alias('s') \
+                                               .join(df_tgt_hash_val.alias('t'), \
+                                                     [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                     how='inner' ) \
+                                               .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                               .withColumn("src_CreatedDateTime",f.col("s." + src_eff_start_date_col)) \
+                                               .select(['t.*',"src_CreatedDateTime"]) \
+                                               .withColumn('etl_action_cd',f.lit('D')) \
+                                               .withColumn('consent_start_date',f.col('t.consent_start_date')) \
+                                               .withColumn('consent_end_date',f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                    f.col("src_CreatedDateTime").cast("date"), \
+                                                                                    f.lit(None).cast('date')) \
+                                                                               .otherwise(f.col("src_CreatedDateTime").cast("date"))) \
+                                               .withColumn('effective_start_dt',f.col('t.effective_start_dt')) \
+                                               .withColumn('effective_end_dt',f.when(f.col(src_eff_start_date_col).cast("date") == \
+                                                                                    f.col("src_CreatedDateTime").cast("date"), \
+                                                                                    f.current_date()) \
+                                                                               .otherwise(f.col("src_CreatedDateTime").cast("date"))) \
+                                               .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                               .withColumn('etl_change_ts',f.current_timestamp()) \
+                                                .withColumn('consent_end_date',f.when(f.col("consent_start_date").cast("date") == \
+                                                                                    f.col("consent_end_date").cast("date"), \
+                                                                                    f.lit(None).cast('date')) \
+                                                                               .otherwise(f.col("consent_end_date").cast("date"))) \
+                                               .drop("src_CreatedDateTime") \
+                                               .drop(*hash_column_list)\
+                                               .select(*hist_tbl_clmns)
+
+    logger.info(f"Update records count: {df_update_rec.count()}")
+
+    df_final = df_insert_rec.union(df_update_rec)
+    return df_final
+
+def write_tgt_df(df_write,tgt_format,tgt_mode,tgt_location,key_column_list=None):
+  global snapshot_insert_cnt
+  global hist_insert_cnt
+  global hist_update_cnt
+  logger.info("Storing dataframe...")
+  logger.info(f"Format: {tgt_format}")
+  logger.info(f"Mode: {tgt_mode}")
+  if 'append' in tgt_mode:
+    logger.info("Storing fresh data...")
+    df_write.write \
+            .format(tgt_format) \
+            .mode(tgt_mode) \
+            .save(tgt_location)
+  if 'merge' in tgt_mode:
+    
+    df_src_update=df_write.filter("etl_action_cd!='I'")
+    df_src_insert=df_write.filter("etl_action_cd=='I'")
+    
+    merge_condition_str = ' and '.join(['t.'+c+'= s.'+c for c in key_column_list]) 
+    
+    tbl_tgt = DeltaTable.forPath(spark,tgt_location)
+    df_tgt = tbl_tgt.toDF()
+    
+    update_key_list = [c for c in df_tgt.columns if c not in key_column_list]
+    update_val_list = ['s.'+c for c in update_key_list]
+    update_dict = dict(zip(update_key_list,update_val_list))
+
+    insert_key_list = [c for c in df_tgt.columns]
+    insert_val_list = ['s.'+c for c in insert_key_list]
+    insert_dict = dict(zip(insert_key_list,insert_val_list))
+    
+    
+    hist_insert_cnt = str(df_src_insert.count())
+    hist_update_cnt = str(df_src_update.count())
+    snapshot_insert_cnt = hist_insert_cnt
+
+    logger.info(f"Insert count: {hist_insert_cnt}")
+    logger.info(f"Update count: {hist_update_cnt}")
+    
+    if "_hist" in tgt_location:
+      merge_condition_str = merge_condition_str+" and t.etl_action_cd='I'"
+    else:
+      df_src_update = df_src_update.drop('etl_action_cd')
+      df_src_insert = df_src_insert.drop('etl_action_cd')
+    
+    logger.info(f"Updating {df_src_update.count()} records on {tgt_location}")
+    tbl_tgt.alias('t')\
+      .merge(df_src_update.alias('s'),
+            merge_condition_str
+            )\
+      .whenMatchedUpdate(set = update_dict)\
+    .execute()
+  
+    logger.info(f"Inserting {df_src_insert.count()} records on {tgt_location}")
+    df_src_insert.write.format(tgt_format).mode('append').save(tgt_location)
+
+def src_de_duplicate_process(df,key_column_list,src_order_by_condn,src_system=None):
+  global dedup_cnt, src_tbl_name
+  df_de_duplicate = df.dropDuplicates()
+  if 'THINGS_PLATFORM' in src_system.upper():
+    logger.info(f"Deduplicating common")
+    df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                           .over(Window.partitionBy(*key_column_list) \
+                                                 .orderBy(*[f.col(c).desc() for c in src_order_by_condn]))) \
+                                          .filter("rnk=1")\
+                                          .drop("rnk")
+                     
+  dedup_cnt = str(df_unique.count())
+  logger.info(f"Deduplicate count: {dedup_cnt}")
+  return df_unique
+
+logger.info('Started reading source data')
+try:
+  if 'ADOBE_API' in src_system:
+    if 'PAD' in tgt_tbl_name.upper():
+      apiResponse = read_source_data(sourceSystem = src_system, targetTable = tgt_tbl_name, **json.loads(table_prop))
+  elif 'THINGS_PLATFORM' in src_system.upper():
+    apiResponse = read_source_data(sourceSystem = src_system, targetTable = tgt_tbl_name, **json.loads(table_prop))
+    apiData = apiResponse
+  else:
+    pass
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  # send_slack_notification(dpiSlackChannelId,str(e),False) --DPIA-2939
+  raise Exception("Failed:",str(e))
+logger.info('Ended reading source data')
+
+logger.info('Started storing raw data in landing directory')
+try:
+  if 'ADOBE_API' in src_system:
+    if 'PAD' in tgt_tbl_name.upper():
+      apiResponseStr = json.dumps(apiResponse)
+      landingWritePath = landingPath + f"/unauth_pad_api_data_{current_date}.json"
+      logger.info(f"Writing to landing file : {landingWritePath}")
+      dbutils.fs.put(landingWritePath,apiResponseStr,True)
+  elif 'THINGS_PLATFORM' in src_system:
+  
+    tgt_raw_path = source_path.split('/')[:-1]
+    tgt_raw_path.append(tgt_tbl_name.split('.')[1].split('_hist')[0])
+    tgt_raw_path_temp = "/".join(tgt_raw_path)
+    api_file_name=f"{tgt_raw_path_temp}/{current_date}/things_platform_{tgt_tbl_name.split('.')[1].split('_hist')[0]}_{current_date}.csv"
+    api_file_name = f"{adlsRootPath}{api_file_name}"
+    logger.info(f"Landing_path: {api_file_name}")
+    api_temp_location= f"/dbfs/tmp/things_platform_{tgt_tbl_name.split('.')[1].split('_hist')[0]}.csv"
+    logger.info(f"api_temp_path: {api_temp_location}")
+    pdf = pd.read_csv(io.StringIO(apiData.decode('utf-8')),sep=",")
+    pdf.to_csv(api_temp_location,index=False)
+    dbutils.fs.mv(f"dbfs:/tmp/things_platform_{tgt_tbl_name.split('.')[1].split('_hist')[0]}.csv", api_file_name)
+    # dbutils.fs.rm(api_temp_location)
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended storing raw data in landing directory')
+
+
+logger.info('Started reading raw data from landing directory')
+try:
+  if 'ADOBE_API' in src_system:
+    if 'PAD' in tgt_tbl_name.upper():
+      df_src = spark.createDataFrame([Row(**{"totals":apiResponse['summaryData']['totals']})])
+  elif 'THINGS_PLATFORM' in src_system:
+    
+    df_src = spark.read.option("header",True).csv(api_file_name)
+    raw_cnt = df_src.count()
+    logger.info(f"Raw data count: {raw_cnt}")
+    df_src = df_src.filter(src_filter_condn)
+    df_src = df_src.na.fill({"MSISDN": ''})\
+                    .withColumn("CreatedDateTime",f.col("CreatedDateTime").cast('timestamp'))
+    df_src = df_src.withColumn('CreatedDateTime', f.col('CreatedDateTime') + f.expr("INTERVAL -8 HOURS") )\
+                       .withColumn("MSISDN",f.regexp_replace("MSISDN", "[^0-9]+", ""))\
+                        .withColumn("CurrentValue",f.when(f.col("CurrentValue").isin(['OptOut','Opt Out']),\
+                                                           f.lit("Opt-out"))\
+                                            .when(f.col("CurrentValue").isin(['Opt In','OptIn']),\
+                                                           f.lit("Opt-in"))\
+                                            .otherwise(f.col("CurrentValue")))\
+                        .withColumn("Ban",f.col("Ban").cast('Bigint').cast('string'))
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+logger.info('Ended reading raw data from landing directory')
+
+
+logger.info('Started encrypting PII columns')
+try:
+  df_src.createOrReplaceTempView('df_src_vw')
+  encr_col_list = df_src.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col = ','.join(final_col)
+  logger.info(f'Encryption columns: {encr_dict.keys()}')
+  encr_qry = f"SELECT {select_col} FROM df_src_vw"
+  logger.info(f'Encryption query: {encr_qry}')
+  df_src = spark.sql(encr_qry)
+  logger.info('Creating parquet dataframe')
+  df_src = df_src.select([f.col(col).alias(col.replace(' ','_')) for col in df_src.columns])
+  df_src.cache().write.format('parquet') \
+                      .mode('overwrite') \
+                      .save(raw_archive_path)
+  logger.info(f'Stored at raw archive path: {raw_archive_path}')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  # send_slack_notification(dpiSlackChannelId,str(e),False) --DPIA-2939
+  raise Exception("Failed:",str(e))
+logger.info('Ended encrypting PII columns')
+
+logger.info('Started getting count of source data')
+try:
+  df_src = spark.read.format('parquet').load(raw_archive_path)
+  src_cnt = df_src.cache().count()
+  src_filter_cnt = src_cnt
+  logger.info(f"Source data count: {src_filter_cnt}")
+  if src_cnt == 0:
+    raise Exception("Source data count 0. No data in source")
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  # send_slack_notification(dpiSlackChannelId,str(e),False) --DPIA-2939
+  raise Exception(f"Failed: {e}")
+logger.info('Ended getting count of source data')
+
+
+logger.info('Started deduplicating source data')
+try:
+  if 'THINGS_PLATFORM' in src_system:
+
+    df_src = src_de_duplicate_process(df_src,key_column_list,src_order_by_condn,src_system)  
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  # send_slack_notification(dpiSlackChannelId,str(e),False) --DPIA-2939
+  raise Exception("Failed:",str(e))
+logger.info('Ended deduplicating source data')
+
+
+logger.info('Started writing data to main table')
+try:
+  if 'APPEND' in json.loads(job_type)['HIST_LOAD_TYPE']:
+    if 'ADOBE_API' in src_system:
+      if 'PAD' in tgt_tbl_name.upper():
+        logger.info("Storing final dataframe...")
+        logger.info(f"Data count: {df_src.count()}")
+        brandList = ['Magenta', 'Magenta', 'Magenta',
+                    'Metro', 'Metro', 'Metro',
+                    'Assurance Wireless', 'Assurance Wireless', 'Assurance Wireless',
+                    'Sprint', 'Sprint', 'Sprint',
+                    'Prepaid Magenta', 'Prepaid Magenta', 'Prepaid Magenta']
+        ConsentValueList = ['Unsepcified', 'OptIn', 'OptOut',
+                    'Unsepcified', 'OptIn', 'OptOut',
+                    'Unsepcified', 'OptIn', 'OptOut',
+                    'Unsepcified', 'OptIn', 'OptOut',
+                    'Unsepcified', 'OptIn', 'OptOut',]
+        dataList = []
+        for apiRow,brandName,ConsentValue in zip(apiResponse['summaryData']['totals'],brandList,ConsentValueList):
+          dataList.append(Row(**{
+            "api_date": start_date,
+            "brand": brandName,
+            "consent_value": ConsentValue,
+            "count": apiRow
+          }))
+        apiDF = spark.createDataFrame(dataList)
+        df = apiDF.withColumn('api_date',f.col('api_date').cast('date')) \
+                  .withColumn('etl_load_dt',f.current_date()) \
+                  .withColumn('etl_load_ts',f.current_timestamp())
+        write_tgt_df(
+          df_write = df,
+          tgt_format = "delta",
+          tgt_mode = "append",
+          tgt_location = tgt_tbl_path
+        )
+        logger.info("Stored final dataframe!!!")
+  if 'INCR-KEY-MERGE-LD' in json.loads(job_type)['HIST_LOAD_TYPE']:
+    if 'THINGS_PLATFORM' in src_system:
+      df_tgt_hist = spark.sql(f"SELECT * FROM {tgt_tbl_name} where etl_action_cd = 'I'")
+      df_hist_w = incr_key_merge_process(df_src,df_tgt_hist,key_column_list,hist_load_type,src_system)
+      df_hist_w = df_hist_w.withColumn('CURR_IND',f.lit('Y')).select(*[df_tgt_hist.columns])
+      stg_path = f"{tgt_tbl_path.replace('processed','stage')}/{current_date}"
+      logger.info(f"Staging data at: {stg_path}")
+      df_hist_w.write.format("parquet").mode("overwrite").save(stg_path)
+      df_hist = spark.read.format("parquet").load(stg_path)
+        # display(df_hist)
+
+      write_tgt_df(df_write = df_hist,
+                     tgt_format = 'delta',
+                     tgt_mode = 'merge',
+                     tgt_location = tgt_tbl_path,
+                     key_column_list = key_column_list
+                    )
+
+      df_stag = spark.read.load(tgt_tbl_path)
+      src_order_by_condn_indi = ['CreatedDateTime','etl_action_cd']
+      df_stag = df_stag.withColumn('rnk',f.row_number() \
+                                         .over(Window.partitionBy(*key_column_list) \
+                                               .orderBy(*[f.col(c).desc() for c in src_order_by_condn_indi]))) \
+                              .withColumn("CURR_IND",f.when(f.col("rnk") == 1,\
+                                                            f.lit("Y"))\
+                                          .otherwise(f.lit("N")))\
+                                          .drop("rnk").select(*[df_tgt_hist.columns])
+
+      df_stag.write.format("delta").mode('overwrite').save(tgt_tbl_path)
+      logger.info("Stored final dataframe!!!")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended writing data to main table')
+
+logger.info('Started optimizing table')
+try:
+  optQuery = f"OPTIMIZE {tgt_tbl_name} ZORDER BY {zorder_columns}"
+  logger.info(f"{optQuery}")
+  spark.sql(optQuery)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended optimizing table')
+
+
+logger.info('Started inserting audit counts')
+try:
+  audit_insert_qry_str = '''
+                            insert into validation.dpi_genius_audit 
+                            select {},{},{},{},{},{},{},current_timestamp(),{}
+                         '''.format(repr(source_name), \
+                                    repr(raw_cnt), \
+                                    repr(src_filter_cnt), \
+                                    repr(dedup_cnt), \
+                                    repr(snapshot_insert_cnt), \
+                                    repr(hist_insert_cnt), \
+                                    repr(hist_update_cnt), \
+                                    repr(str(current_date))
+                          )
+  logger.info(f"Audit table insert query: {audit_insert_qry_str}")
+  spark.sql(audit_insert_qry_str)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+logger.info('Ended inserting audit counts')
+
+
+try:
+  logger.info(f"Ended Job: {runId}")
+  logger.info('Started clearing cache')
+  spark.catalog.clearCache()
+  logger.info('Ended clearing cache')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  # send_slack_notification(dpiSlackChannelId,str(e),False) --DPIA-2939
+  raise Exception("Failed:",str(e))
+
+
+dbutils.notebook.exit('Ended successfully')
+
+
