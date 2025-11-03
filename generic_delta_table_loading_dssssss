@@ -1,0 +1,2136 @@
+%run  ./common/adls_config
+
+%run  ./common/Logging_DPI
+
+%run  ./common/InitializeKeyPairConfig
+
+%scala
+val runId = dbutils.notebook.getContext.currentRunId.getOrElse(System.currentTimeMillis() / 1000L).toString
+Seq(runId).toDF("run_id").createOrReplaceTempView("run_id")
+
+runId = spark.table("run_id").head()["run_id"]
+runId = runId.replace('RunId(', '').replace(')', '')
+
+# Configuring the properties of logging
+pipelineName = 'generic_delta_table_loading'
+propertiesException = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'Geniusdelta_table_CriticalException'}}
+propertiesLogInfo = {'custom_dimensions': {'PipelineName': f'{pipelineName}', 'runId': f'{runId}', 'AlertType': 'parameter_Loading'}}
+
+import json, os
+from delta.tables import *
+from datetime import datetime
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pyspark.sql.window import Window
+
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+spark.conf.set("spark.sql.shuffle.partitions","auto")
+
+spark.catalog.clearCache()
+
+try:
+  secretScope = dbutils.widgets.get('keyvault_name')
+  logger.info(f"Secret Scope: {secretScope}")
+
+
+except Exception as e:
+  logger.exception(f"Exception: {e}")
+  raise Exception(f"Failed: {e}")
+
+try:
+  source_path = dbutils.widgets.get('source_path')
+  table_prop = dbutils.widgets.get('table_prop')
+  tgt_path = dbutils.widgets.get('tgt_path')
+  job_type = dbutils.widgets.get('job_type')
+  src_system = dbutils.widgets.get('src_system')
+  file_name = dbutils.widgets.get('file_name')
+  src_tbl_name = dbutils.widgets.get('src_tbl_name')
+  
+
+  snapshot_tbl_name = json.loads(table_prop)['SNAPSHOT_TBL'].upper()
+  hist_tbl_name = json.loads(table_prop)['HIST_TBL'].upper()
+  key_column_list = None
+  if 'KEY_COLUMNS' in table_prop:
+    key_column_list = [x.lower() for x in list(json.loads(table_prop)['KEY_COLUMNS']) ]
+    dedup_columns = []
+    for clmn in key_column_list:
+      if clmn.startswith("date("):
+        key_column_list.remove(clmn)
+        clmn = clmn.replace("date(","").replace(")","")
+        dedup_columns.append(f.col(clmn).astype('date'))
+      else:
+        dedup_columns.append(clmn)
+  else:
+    key_column_list = []
+    dedup_columns = []
+  if 'SNAP_KEY_COLUMNS' in table_prop:
+    snapshot_key_columns = [x.lower() for x in list(json.loads(table_prop)['SNAP_KEY_COLUMNS']) ]
+  else:
+    snapshot_key_columns = []
+  
+  snapshot_tbl_path = json.loads(table_prop)['SNAPSHOT_TBL'].replace('.','/')
+  hist_tbl_path = json.loads(table_prop)['HIST_TBL'].replace('.','/')
+
+  hist_load_type = json.loads(job_type)['HIST_LOAD_TYPE']
+  snapshot_load_type = json.loads(job_type)['SNAPSHOT_LOAD_TYPE']
+  src_type = json.loads(table_prop)['SourceType'].upper()
+
+  src_order_by_condn = None
+  src_filter_condn = None
+  ignore_rerun = None
+  src_delim=','
+  src_hdr='TRUE'
+  rec_cnt = 0
+  encr_dict = {}
+  src_part = {}
+
+  if 'DE_DUPLICATE_SRC' in table_prop and json.loads(table_prop)['DE_DUPLICATE_SRC'].upper() == 'TRUE':
+    src_order_by_condn =  json.loads(table_prop)['SRC_ORDER_BY_CONDTN']
+    print('src_order_by_condn:',src_order_by_condn)
+  else:
+    src_order_by_condn = []
+  if 'SRC_FILTER_CONDTN' in table_prop:
+    src_filter_condn = json.loads(table_prop)['SRC_FILTER_CONDTN']
+    print('src_filter_condn:',src_filter_condn)
+  if 'SRC_DELIMITER' in table_prop:
+    src_delim = json.loads(table_prop)['SRC_DELIMITER']
+  if 'SRC_HEADER' in table_prop:
+    src_hdr = json.loads(table_prop)['SRC_HEADER'].upper()
+  if 'FILTER_HIST' in table_prop and json.loads(table_prop)['FILTER_HIST'].upper() == 'TRUE':
+    filt_hist = True
+  else:
+    filt_hist = False
+  if 'HIST_FILTER_CONDTN' in table_prop:
+    hist_filter_condtn = json.loads(table_prop)['HIST_FILTER_CONDTN']
+  else:
+    hist_filter_condtn = None
+  if 'HIST_3_DAYS' in table_prop and json.loads(table_prop)['HIST_3_DAYS'].upper() == 'TRUE':
+    is_3_day_hist = True
+  else:
+    is_3_day_hist = False
+  if 'SELECT_COLUMNS' in table_prop and len(json.loads(table_prop)['SELECT_COLUMNS']) > 0:
+    select_columns = json.loads(table_prop)['SELECT_COLUMNS']
+  else:
+    select_columns = None
+
+  if 'IGNORE_RERUN' in table_prop:
+    ignore_rerun = json.loads(table_prop)['IGNORE_RERUN']
+
+
+  print('hist_tbl_path:',hist_tbl_path)
+  print('source_path:',source_path)
+  print('tgt_path:',tgt_path)
+  print('table_prop:',table_prop)
+  print('snapshot_tbl_name:',snapshot_tbl_name)
+  print('key_column_list:',key_column_list)
+  print('dedup_columns:',dedup_columns)
+  print('snapshot_key_columns:',snapshot_key_columns)
+  print('hist_load_type:',hist_load_type)
+  print('snapshot_load_type:',snapshot_load_type)
+  print('src_tbl_name:',src_tbl_name)
+  print('src_system:',src_system)
+  print('file_name:',file_name)
+  print('src_delim:',src_delim)
+  print('src_hdr:',src_hdr)
+  print('src_type:',src_type)
+
+  hash_column_list=['hash_key','hash_diff']
+  snapshot_audit_column_list=['etl_load_dt','etl_load_ts']
+  upsert_column_drop_list = hash_column_list + snapshot_audit_column_list
+  print('hash_column_list:',hash_column_list)
+  print('snapshot_audit_column_list:',snapshot_audit_column_list)
+  print('upsert_column_drop_list:',upsert_column_drop_list)
+  print('ignore_rerun:',ignore_rerun)
+
+  current_date=datetime.now().date()
+  tgt_path_list=tgt_path.split('/')[:-1]
+  tgt_path_list.append('raw')
+  tgt_path_list.append(snapshot_tbl_name.split('.')[0])
+  tgt_path_list.append(snapshot_tbl_name.split('.')[1])
+  tgt_path_list.append(str(current_date))
+  tgt_archive_path_tmp = "/".join(tgt_path_list)
+  tgt_archive_path=tgt_archive_path_tmp.lower()
+  raw_archive_path = f"{adlsRootPath}/{tgt_archive_path}"
+  print('raw_archive_path:',raw_archive_path)
+  SRC_EFF_START_DATE=None
+  if 'SRC_EFF_START_DATE' in table_prop:
+    src_eff_start_date_col = json.loads(table_prop)['SRC_EFF_START_DATE']
+    print('src_eff_start_date_col:',src_eff_start_date_col)
+  if 'ENCR_DICT' in table_prop:
+    encr_dict = json.loads(table_prop)['ENCR_DICT']
+  print('encr_dict:',encr_dict)
+  if 'SRC_PART' in table_prop:
+    src_part = json.loads(table_prop)['SRC_PART']
+  print('src_part:',src_part)
+  snapshot_tbl_name_tmp=snapshot_tbl_name.replace('.','_')
+  tmp_write_path=f"{adlsRootPath}tmp/{snapshot_tbl_name_tmp}"
+  print('tmp_write_path:',tmp_write_path)
+  source_name=snapshot_tbl_name
+  print('Audit source name:',source_name)
+  src_filter_cnt='NA'
+  dedup_cnt='NA'
+  snapshot_insert_cnt='0'
+  hist_insert_cnt='0'
+  hist_update_cnt='0'
+  raw_cnt = 'NA'
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+env = os.getenv("ENV")
+
+def read_src_data(
+     src_system
+    ,source_path
+    ,src_format='CSV'
+    ,src_delimiter=','
+    ,src_header=True
+    ,filter_condn=None
+    ,select_columns=None
+    ):
+  # Return a df reading from a data source
+  # source type: File, table oracle or snowflake,
+
+  global raw_cnt
+  global src_filter_cnt
+  global src_part
+
+  if 'FILE' in src_system:
+    df_src = spark.read.format(src_format) \
+      .option('delimiter',src_delimiter) \
+      .option('header',src_header) \
+      .load(f"{adlsRootPath}/{source_path}")
+    raw_cnt = str(df_src.count())
+
+    if 'ADOBE' in src_system:
+      src_df_columns = df_src.columns
+      src_df_columns.append('file_name')
+
+      df_src_formatted = df_src.withColumn('Derived_Source_Date',f.to_date(f.concat_ws('-',f.substring(f.col('Date'),-4,4),f.upper(f.substring(f.col('Date'),1,3)),f.lpad(f.split(f.split(f.col('Date'),' ')[1],',')[0],2,'0')),'yyyy-MMM-dd'))\
+      .withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])\
+      .drop(f.col('Date'))\
+      .withColumnRenamed('Derived_Source_Date','Date')\
+      .select(*src_df_columns)
+      
+      source_path_without_star = source_path[:-1]
+      all_adobe_file=dbutils.fs.ls(f"{adlsRootPath}/{source_path_without_star}")
+      adobe_csv_file=[]
+      for i in all_adobe_file:
+        if i.name.endswith('.csv'):
+          adobe_csv_file.append(i.name.split(' '))
+      adobe_column=['file_name']
+      df_src_file_name=spark.createDataFrame(adobe_csv_file,adobe_column)
+      
+      df_validation=df_src_file_name.withColumn('file_date',f.to_date(f.split(f.split(f.col('file_name'),'_')[3],'\.')[0],'yyyyMMdd'))\
+      .withColumn('expected_file_name',f.array_sort(f.array((f.concat(f.lit('dns_unauth_toggleon_'),f.date_format(f.col('file_date'),'yyyyMMdd'),f.lit('.csv'))),(f.concat(f.lit('dns_unauth_toggleoff_'),f.date_format(f.col('file_date'),'yyyyMMdd'),f.lit('.csv'))))))
+
+      df_validation_check=df_validation.groupBy((f.col('file_date')),(f.col('expected_file_name'))).agg(f.sort_array(f.collect_set(f.col('file_name'))).alias('actual_file_name'))
+      df_final_validaiton=df_validation_check.withColumn('file_check',f.when(f.col('expected_file_name') == f.col('actual_file_name'),f.lit(1)) .otherwise(f.lit(0)))
+      #display(df_final_validaiton)
+      validation_result = df_final_validaiton.filter("file_check = 0").count()
+      if validation_result == 0 :
+        print('validation passed')
+      else:
+        print('validation failed.Exitting with error.')
+        raise Exception('Adobe file validation failed as we have not received 2 files for a given date. please check once')
+      #df_src_final = df_validation.drop(*['file_date','expected_file_name'])
+      df_src_final = df_src_formatted
+      return df_src_final
+    elif 'IAM_TMO' in src_system:
+      df_src = df_src.withColumn('_c10_converted_ts',f.to_timestamp((f.col('_c10')),"yyyyMMdd HH:mm:ss"))\
+                      .withColumn('_c11_converted_ts',f.to_timestamp((f.col('_c11')),"yyyyMMdd HH:mm:ss"))\
+                      .drop(*['_c10','_c11'])
+      col_list=df_src.columns[0:10]+df_src.columns[-2:]+df_src.columns[10:12]
+      df_src_formatted =df_src.select(*col_list).withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])     
+      return df_src_formatted
+
+    elif 'ONETRUST' in src_system:
+      src_df_columns = df_src.columns
+      src_df_columns.append('file_name')
+      df_src_formatted = df_src.withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])\
+                               .select(*src_df_columns)
+      
+      if "dsr_request" in snapshot_tbl_name.lower():
+        print(f"Table name is {snapshot_tbl_name}")
+        date_columns = [1,6,7,10,11,13,18,21,22,35,63]
+        for ix in date_columns:
+          if ix in [35,63]:
+            df_src_formatted = df_src_formatted.withColumn(df_src_formatted.columns[ix], \
+                                                         f.to_date(f.col(df_src_formatted.columns[ix]), \
+                                                                        'dd/MMM/yyyy') \
+                                                        )
+          else:
+            df_src_formatted = df_src_formatted.withColumn(df_src_formatted.columns[ix], \
+                                                           f.to_timestamp(f.col(df_src_formatted.columns[ix]), \
+                                                                          'MM/dd/yyyy hh:mm a') \
+                                                          )
+      elif "dsr_subtask" in snapshot_tbl_name.lower():
+        print(f"Table name is {snapshot_tbl_name}")
+        date_columns = [4,5,6,7,9,10,11,19,23]
+        for ix in date_columns:
+          df_src_formatted = df_src_formatted.withColumn(df_src_formatted.columns[ix], \
+                                                         f.to_timestamp(f.col(df_src_formatted.columns[ix]), \
+                                                                        'MM/dd/yyyy hh:mm a') \
+                                                        )
+            
+      return df_src_formatted
+    elif 'CDPM' in src_system:
+      print("Source is CDPM")
+      print(f"File count is: {df_src.count()}")
+      df_src_formatted = df_src.withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])
+      src_df_col_list = df_src_formatted.columns
+      status_cd_col = filter_condn.split(' ')[0]
+      print('status_cd_col:',status_cd_col)
+      str_len=len(filter_condn.split(' ')[0])
+      status_dt_col = filter_condn.split(' ')[0][:str_len-2]+'DT'
+      print('status_dt_col:',status_dt_col)
+      update_dt_col = df_src_formatted.columns[4]
+      df_final_col_list = src_df_col_list[:4]+['Update_Date','consent_type','consent_value', \
+                                               'consent_start_date','Consent_End_Date','file_name']
+      consent_type_val = snapshot_tbl_name.split('.')[1].upper()
+      df_src_formatted = df_src_formatted.withColumn('consent_type',f.lit(consent_type_val)) \
+                          .withColumn('consent_value', 
+                                      f.when((f.col(status_cd_col) == 'Y'),f.lit('OptIn')) \
+                                       .when((f.col(status_cd_col) == 'N'),f.lit('OptOut')) \
+                                       .otherwise(f.lit(None))) \
+                          .withColumn('Consent_End_Date',f.lit(None).cast('timestamp')) \
+                          .withColumn('TIME_ZONE',f.when(f.col('TIME_ZONE') == 'EST','EST5EDT') \
+                                                     .otherwise(f.col('TIME_ZONE'))) \
+                          .withColumn("update_date",f.from_utc_timestamp(f.to_utc_timestamp(f.unix_timestamp(f.col(update_dt_col), \
+                                                                                    "MM/dd/yyyy HH:mm:ss").cast("timestamp"), \
+                                                                        f.col('TIME_ZONE')), \
+                                                                                             'PST')) \
+                          .withColumn("consent_start_date", \
+                                      f.from_utc_timestamp(f.to_utc_timestamp(f.unix_timestamp(f.col(status_dt_col), \
+                                      "MM/dd/yyyy HH:mm:ss").cast("timestamp"),f.col('TIME_ZONE')),'PST')) \
+                          .select(*df_final_col_list) \
+                          .filter(f.col('consent_value').isNotNull())
+      src_filter_cnt = str(df_src_formatted.count())
+      return df_src_formatted
+    elif 'IAM_ENHANCED' in src_system:
+      df_src = spark.read.format(src_format) \
+                         .option('delimiter',src_delimiter) \
+                         .option('header',src_header) \
+                         .option('inferSchema',True) \
+                         .load(f"{adlsRootPath}/{source_path}")
+      df_src = df_src.withColumn('active_sub_flag',f.lit('Y')) \
+                     .withColumn('file_name',f.reverse(f.split(f.input_file_name(),'/'))[0])
+      src_col_list = df_src.columns
+      df_tmp = df_src.withColumn('msisdn',f.col('msisdn').cast(t.StringType()))\
+                     .withColumn('preferencesettime',f.col('preferencesettime').cast('timestamp'))
+      df_src_formatted = df_tmp.select(*src_col_list)
+      if filter_condn:
+        df_src_formatted = df_src_formatted.filter(filter_condn)
+        src_filter_cnt = str(df_src_formatted.count())
+        return df_src_formatted
+      else:
+        return df_src_formatted
+    elif 'BPM_FILE' in src_system:
+      df_src_formatted = df_src.withColumn("CREATED",f.to_timestamp(f.col("CREATED"),"MM/dd/yyyy h:mm:ss.SSS a")) \
+                              .withColumn("LAST_UPD",f.to_timestamp(f.col("LAST_UPD"),"MM/dd/yyyy h:mm:ss.SSS a")) \
+                              .withColumn("file_name",f.reverse(f.split(f.input_file_name(),"/"))[0])
+      return df_src_formatted
+    else:
+      return df_src
+  if 'TABLE_ORACLE' in src_system:
+    src_tbl_name = source_path
+    if filter_condn is None:
+      if select_columns:
+        cols = ",".join(select_columns)
+        query = f"(select /*+ PARALLEL (t,8) +*/ {cols} from {src_tbl_name} t) test"
+      else:
+        query = f"(select /*+ PARALLEL (t,8) +*/ * from {src_tbl_name} t) test"
+    if filter_condn:
+      if select_columns:
+        cols = ",".join(select_columns)
+        query = f"(select /*+ PARALLEL (t,8) +*/ {cols} from {src_tbl_name} t where {filter_condn}) test"
+      else:
+        query = f"(select /*+ PARALLEL (t,8) +*/ * from {src_tbl_name} t where {filter_condn}) test"
+    
+    if 'CHUB' in src_system:
+      src_tbl_name = source_path
+      jdbcHostname = "pcmdrpa-scan.unix.gsm1900.org"
+      jdbcDatabase = "pcmdr"
+      jdbcPort = "7263"
+      username = "SVC_PRD_DPTC"
+      driver = "oracle.jdbc.driver.OracleDriver"
+
+      password = dbutils.secrets.get(scope = secretScope, key = "chub-prd-password")
+      jdbcUrl = "jdbc:oracle:thin:@//{0}:{1}/{2}".format(jdbcHostname, jdbcPort, jdbcDatabase)
+      
+      print("jdbcUrl:",jdbcUrl)
+      print("query:",query)
+      
+      if len(src_part.keys()) == 0:
+        jdbcOptions = {}
+      else:
+        partitionColumn = src_part["partition_column"]
+        lowerBound = src_part["lower_bound"]
+        upperBound = src_part["upper_bound"]
+        print(f"Partition by {partitionColumn} from {lowerBound} to {upperBound}")
+        if 'dns' in src_tbl_name.lower():
+          jdbcOptions = {
+                          "partitionColumn": partitionColumn,
+                          "lowerBound": lowerBound,
+                          "upperBound": upperBound,
+                          "numPartitions": 8,
+                          "fetchsize": 10000000,
+                          "oracle.jdbc.mapDateToTimestamp": "false",
+                          "sessionInitStatement": "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"
+                        }
+        else:
+          jdbcOptions = {
+                          "partitionColumn": partitionColumn,
+                          "lowerBound": lowerBound,
+                          "upperBound": upperBound,
+                          "numPartitions": 8,
+                          "fetchsize": 10000000,
+                          "oracle.jdbc.mapDateToTimestamp": "false",
+                          "sessionInitStatement": "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF'"
+                        }
+      print("JDBC Options:",jdbcOptions)
+
+      df = spark.read.format("jdbc") \
+                    .option("url",jdbcUrl) \
+                    .option("dbtable",query) \
+                    .option("user",username) \
+                    .option("password",password) \
+                    .option("driver",driver) \
+                    .options(**jdbcOptions) \
+                    .load()
+
+      raw_cnt = str(df.count())
+      print('raw_cnt:',raw_cnt)
+      if src_system == 'CHUB_OptInOut_TABLE_ORACLE':
+        if 'dns' in src_tbl_name.lower():
+          df = df.withColumn('DNS_SETTING_DT',f.col('DNS_SETTING_DT').cast('date')) \
+                  .withColumn('CREATED',f.col('CREATED').cast('date')) \
+                  .withColumn('LAST_UPD',f.col('LAST_UPD').cast('date'))
+          df = df.withColumn('DNS_SETTING',f.when(f.col('DNS_SETTING') == 'DoNotSell',f.lit('OptOut')) \
+                                            .when(f.col('DNS_SETTING') == 'Sell',f.lit('OptIn')) \
+                                            .otherwise(None)
+                            )
+        else:
+          df = df.withColumn('CONSENT_STATUS',f.when(f.col('CONSENT_STATUS') == 'Inactive',f.lit('OptOut')) \
+                                            .when(f.col('CONSENT_STATUS') == 'Active',f.lit('OptIn')) \
+                                            .otherwise(None)
+                            )
+      if 'ECPC' in src_system:
+        df = df.withColumn('table_name',f.lit(src_tbl_name))
+        
+      return df
+    
+    elif 'NOR' in src_system:
+      src_tbl_name = source_path
+      jdbcHostname = "poc0086.corp.sprint.com"
+      jdbcDatabase = "NDWPRD_USR.corp.sprint.com"
+      jdbcPort = "1535"
+      username = "DPI_APP_USER"
+      driver = "oracle.jdbc.driver.OracleDriver"
+ 
+      password = dbutils.secrets.get(scope = secretScope, key = "ndw-prd-password")
+    
+      jdbcUrl = "jdbc:oracle:thin:@//{0}:{1}/{2}".format(jdbcHostname, jdbcPort, jdbcDatabase)
+
+      print("jdbcUrl:",jdbcUrl)
+      print("query:",query)
+
+      if len(src_part.keys()) == 0:
+        jdbcOptions = {}
+      else:
+        partitionColumn = src_part["partition_column"]
+        lowerBound = src_part["lower_bound"]
+        upperBound = src_part["upper_bound"]
+        print(f"Partition by {partitionColumn} from {lowerBound} to {upperBound}")
+        jdbcOptions = {
+                        "partitionColumn": partitionColumn,
+                        "lowerBound": lowerBound,
+                        "upperBound": upperBound,
+                        "numPartitions": 8,
+                        "fetchsize": 10000000,
+                        "oracle.jdbc.mapDateToTimestamp": "false",
+                        "sessionInitStatement": "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"
+                      }
+
+      df = spark.read.format("jdbc") \
+                      .option("url",jdbcUrl) \
+                      .option("dbtable",query) \
+                      .option("user",username) \
+                      .option("password",password) \
+                      .option("oracle.jdbc.timezoneAsRegion","false") \
+                      .option("driver",driver) \
+                      .options(**jdbcOptions) \
+                      .load()
+      
+      raw_cnt = str(df.count())
+      
+      if 'EXPIRATION_DATE' in df.columns:
+        df = df.withColumn('EXPIRATION_DATE',f.when(f.col('EXPIRATION_DATE') <= f.current_date(),f.col('EXPIRATION_DATE')) \
+                                              .otherwise(None)
+                          )
+      return df
+  elif 'TABLE_TERADATA' in src_system:
+    if 'IDW' in src_system:
+      src_tbl_name = source_path
+      driver = os.getenv("idw_teradata_driver")
+      url = os.getenv("idw_teradata_url")
+      user = os.getenv("idw_teradata_user")
+      password = dbutils.secrets.get(scope = secretScope, key = os.getenv("idw_teradata_psw_secretkey"))
+      
+      if filter_condn is None:
+        query = f"(select * from {src_tbl_name}) test"
+      if filter_condn:
+        if 'IDW_TD_CORE_PUBLIC_V.CUSTOMER_CONSENT_PREFERENCE' in src_tbl_name:
+          query= f"""(
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid is not null
+              and email_addr_sid<> -1
+            union
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid is  null
+            union
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid=-1 )x """
+        else:
+          query = f"(select  * from {src_tbl_name} where {filter_condn}) test"
+      print('qry:',query)
+
+      df = spark.read.format("jdbc") \
+               .option("url", url) \
+               .option("user", user) \
+               .option("password", password) \
+               .option("dbtable", query) \
+               .option("driver",driver) \
+               .load()
+               
+      if 'IDW_TD_CORE_PUBLIC_V.CUSTOMER_CONSENT_PREFERENCE' in src_tbl_name:
+        df = df.withColumn('CNSNT_PRFRNC_CVAL',f.when(f.col('CNSNT_PRFRNC_CVAL') == 'DoNotSell',f.lit('OptOut')) \
+                                          .when(f.col('CNSNT_PRFRNC_CVAL') == 'Sell',f.lit('OptIn')) \
+                                          .when(f.col('CNSNT_PRFRNC_CVAL').isNull(),f.lit('OptOut')) \
+                                          .otherwise(None)
+                          )
+        df = df.withColumn('EFF_END_DTTM',f.when(f.col('EFF_END_DTTM') <= f.current_date(),f.col('EFF_END_DTTM')) \
+                                          .otherwise(None)
+                          )
+      return df
+    
+    if 'BMW' in src_system:
+      print("Source is BMW")
+      src_tbl_name = source_path
+      url = "jdbc:teradata://w-cop1.corp.sprint.com/Database=SRVC_DPI_ADM"
+      user = "SRVC_DPI_ADM"
+      password = dbutils.secrets.get(scope = secretScope, key = "bmw-prd-password")
+      query = f"select * from {src_tbl_name}"
+      print(query)
+      driver = "com.teradata.jdbc.TeraDriver"
+      
+      df_src_formatted = spark.read.format("jdbc") \
+                                   .option("url", url) \
+                                   .option("user", user) \
+                                   .option("password", password) \
+                                   .option("query", query) \
+                                   .option("driver",driver) \
+                                   .option("sslmode","disable") \
+                                   .load()
+      raw_cnt = str(df_src_formatted.count())
+      
+      src_df_col_list = df_src_formatted.columns
+      status_cd_col = filter_condn.split(' ')[0]
+      print('status_cd_col:',status_cd_col)
+      str_len=len(filter_condn.split(' ')[0])
+      status_dt_col = filter_condn.split(' ')[0][:str_len-2]+'TMST'
+      print('status_dt_col:',status_dt_col)
+      df_final_col_list = src_df_col_list[:5]+['Consent_Type','Consent_Value','Consent_Start_Date','Consent_End_Date']
+      consent_type_val = snapshot_tbl_name.split('.')[1].upper()
+      df_src_formatted = df_src_formatted.withColumn('Consent_Type',f.lit(consent_type_val)) \
+                                         .withColumn('Consent_Value', f.when((f.col(status_cd_col) == 'Y'),f.lit('OptIn')) \
+                                                                       .when((f.col(status_cd_col) == 'N'),f.lit('OptOut')) \
+                                                                       .otherwise(f.lit(None))) \
+                                         .withColumnRenamed(status_dt_col,'Consent_Start_Date') \
+                                         .withColumn('TMAY_TIME_ZONE_CD',f.when(f.col('TMAY_TIME_ZONE_CD') == 'EST','EST5EDT') \
+                                                     .otherwise(f.col('TMAY_TIME_ZONE_CD'))) \
+                                         .withColumn("TMAY_LST_UPDT_TMST", \
+                                                     f.from_utc_timestamp(f.to_utc_timestamp(f.col("TMAY_LST_UPDT_TMST") \
+                                                                                             .cast("timestamp"), \
+                                                                                            f.col('TMAY_TIME_ZONE_CD')), \
+                                                                                             'PST')) \
+                                         .withColumn("Consent_Start_Date", \
+                                                     f.from_utc_timestamp(f.to_utc_timestamp(f.col("Consent_Start_Date") \
+                                                                                             .cast("timestamp"), \
+                                                                                            f.col('TMAY_TIME_ZONE_CD')), \
+                                                                                             'PST')) \
+                                         .withColumn('Consent_End_Date',f.lit(None).cast('timestamp')) \
+                                         .select(*df_final_col_list) \
+                                         .filter(f.col('consent_value').isNotNull())
+      src_filter_cnt = str(df_src_formatted.count())
+      return df_src_formatted
+  elif 'TABLE_SNOWFLAKE' in src_system:
+    if 'IDW' in src_system:
+      print('IDW TABLE_SNOWFLAKE enter')
+      src_tbl_name = source_path
+      print(source_path)
+      
+      snw_user = dbutils.secrets.get(scope = secretScope, key = "dpi-service-account-un")
+      #snw_psw = dbutils.secrets.get(scope = secretScope, key = f"rsc-{env}-dptc-control")
+      snw_url = os.getenv("idw_snowflake_url")
+      snw_db = os.getenv("idw_snowflake_db")
+      snw_schema = os.getenv("idw_snowflake_schema")
+      snw_wrhs = os.getenv("idw_snowflake_warehouse")
+
+
+      options = {
+        "sfUrl": snw_url,
+        "sfUser": snw_user,
+        #"sfPassword": snw_psw,
+        "sfDatabase": snw_db,
+        "sfSchema": snw_schema,
+        "sfWarehouse": snw_wrhs
+      }
+      
+      snwflake= "net.snowflake.spark.snowflake" 
+      
+      if filter_condn is None:
+        query = f"(select * from {src_tbl_name}) test"
+      if filter_condn:
+        if f'{snw_db}.{snw_schema}.CUSTOMER_CONSENT_PREFERENCE' in src_tbl_name:
+          query= f"""(
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid is not null
+              and email_addr_sid<> -1
+            union
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid is  null
+            union
+            SELECT  * 
+            from {src_tbl_name} 
+            WHERE {filter_condn}
+              and email_addr_sid=-1 )x """
+        else:
+          query = f"(select  * from {src_tbl_name} where {filter_condn}) test"
+      print('IDW TABLE_SNOWFLAKE query:',query)
+
+      print("Options: ",options)
+      options['pem_private_key'] = private_key_pem
+
+      df = spark.read.format(snwflake) \
+              .options(**options) \
+              .option("query", query).load()
+              
+      if f'{snw_db}.{snw_schema}.CUSTOMER_CONSENT_PREFERENCE' in src_tbl_name:
+        df = df.withColumn('CNSNT_PRFRNC_CVAL',f.when(f.col('CNSNT_PRFRNC_CVAL') == 'DoNotSell',f.lit('OptOut')) \
+                                          .when(f.col('CNSNT_PRFRNC_CVAL') == 'Sell',f.lit('OptIn')) \
+                                          .when(f.col('CNSNT_PRFRNC_CVAL').isNull(),f.lit('OptOut')) \
+                                          .otherwise(None)
+                          )
+        df = df.withColumn('EFF_END_DTTM',f.when(f.col('EFF_END_DTTM') <= f.current_date(),f.col('EFF_END_DTTM')) \
+                                          .otherwise(None)
+                          )
+      return df
+  
+  elif 'i360' in src_system:
+    src_tbl_name = source_path
+    if filter_condn is None:
+      if select_columns:
+        cols = ",".join(select_columns)
+        query = f"select {cols} from {src_tbl_name}"
+      else:
+        query = f"select * from {src_tbl_name}"
+    if filter_condn:
+      if select_columns:
+        cols = ",".join(select_columns)
+        query = f"select {cols} from {src_tbl_name} where {filter_condn}"
+      else:
+        query = f"select * from {src_tbl_name} where {filter_condn}"
+    print('qry:',query)    
+    if 'prizelogic' in src_tbl_name.lower():
+      print("This is TMT")
+      df = spark.sql(f"SELECT * FROM {src_tbl_name}")
+      df = df.withColumn("msisdn",f.col("msisdn").cast("string")) \
+             .withColumn("subscriberid",f.col("subscriberid").cast("string")) \
+             .withColumn("process_id",f.col("process_id").cast("string")) 
+    elif 'cx_non_mktg_cnst' in src_tbl_name.lower():
+      print("This is i360: Non Marketing Consents")
+      df = spark.sql(query)
+      df = df.withColumn('CONSENT_STATUS',f.when(f.col('CONSENT_STATUS') == 'Inactive',f.lit('OptOut')) \
+                                          .when(f.col('CONSENT_STATUS') == 'Active',f.lit('OptIn')) \
+                                          .otherwise(None)
+                          )
+      df = df.withColumn('EFF_END_DTTM',f.when(f.col('EFF_END_DTTM') <= f.current_date(),f.col('EFF_END_DTTM')) \
+                                          .otherwise(None)
+                          )
+    elif 'cx_consr_priv' in src_tbl_name.lower():
+      print("This is i360: DNS")
+      df = spark.sql(query)
+    else:
+      df = spark.sql(query)
+    return df
+
+def read_tgt_delta(snapshot_tbl_name,filter_condition=None):
+  if filter_condition is None:
+    tgt_snapshot_sql_qry_str = f"select * from {snapshot_tbl_name}"
+  else:
+    tgt_snapshot_sql_qry_str = f"select * from {snapshot_tbl_name} where {filter_condition}"
+  print('table read query:',tgt_snapshot_sql_qry_str)
+  return spark.sql(tgt_snapshot_sql_qry_str)
+
+
+def incr_key_merge_process(df_src,df_tgt,key_column_list,job_type,src_system):
+  global src_tbl_name
+  
+  # Remove DPI ETL Columns from target dataframe based on job type
+  if job_type == 'INCR-LD':
+    src_col_without_audit_list = df_tgt.columns[:-2]
+  elif 'INCR-KEY-MERGE-LD' in job_type:
+    src_col_without_audit_list = df_tgt.columns[:-5]
+    # Remove Additional DPI ETL Columns from target dataframe based on job type
+    # This snippet is for IAM rec valid dates logic
+    if src_system == "IAM_ENHANCED_FILE":
+      hist_df = df_tgt
+      hist_tbl_clmns = df_tgt.columns
+      src_col_without_audit_list.remove('rec_valid_start_date')
+      src_col_without_audit_list.remove('rec_valid_end_date')
+      src_col_without_audit_list.remove('consent_start_date')
+      src_col_without_audit_list.remove('consent_end_date')
+    # This snippet is for CHUB consent start & end dates logic
+    elif 'CONSENT_START_DATE' in df_tgt.columns and 'CHUB' in src_system:
+      hist_df = df_tgt
+      hist_tbl_clmns = df_tgt.columns
+      print("tgt column",df_tgt.columns)
+      src_col_without_audit_list.remove("CONSENT_START_DATE")
+      src_col_without_audit_list.remove("CONSENT_END_DATE")
+      df_tgt = df_tgt.drop('CONSENT_START_DATE','CONSENT_END_DATE','CONSENT_DATE_IS_NULL')
+      if 'PARENTAL' in src_tbl_name:
+        src_col_without_audit_list.remove("CONSENT_DATE_IS_NULL")
+        df_tgt = df_tgt.drop('CONSENT_DATE_IS_NULL')
+      
+  # Format source dataframe with columns from target dataframe
+  if "ONETRUST_DSR_FILE" in src_system.upper():
+    df_src = df_src.withColumn("Delivery_Method_Dynamic_Data", f.when(f.col("Ref_value").isNotNull(),f.col("Ref_value"))\
+                               .otherwise(f.col("Delivery_Method_Dynamic_Data"))) \
+                               .drop("Ref_value")
+  # Else: Normal process
+  df_src_formatted = df_src.toDF(*src_col_without_audit_list)
+  diff_column_list = [x.lower() for x in src_col_without_audit_list if x.lower() not in key_column_list]
+  if 'FILE' in src_system:
+    diff_column_list.remove('file_name')
+
+  # Compute hash values for key and difference columns
+  print(f'Key columns list: {key_column_list}')
+  print(f'Difference columns list: {diff_column_list}')
+  df_src_hash_val = df_src_formatted.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                                   .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+  df_tgt_hash_val = df_tgt.withColumn('hash_key',f.sha2(f.concat_ws('|',*key_column_list),256))\
+                                   .withColumn('hash_diff',f.sha2(f.concat_ws('|',*diff_column_list),256))
+  
+  print('Source count:',df_src_hash_val.count())
+  print('Target count:',df_tgt_hash_val.count())
+  
+  # Snippet for Snapshot Table/Incremental load i.e. SCD type 1 table
+  if job_type == 'INCR-LD':
+    df_insert_rec = df_src_hash_val.alias('s').join(df_tgt_hash_val.alias('t'),
+                                                    [f.col('s.hash_key') == f.col('t.hash_key')
+                                                    ],
+                                                    how='left_anti' )\
+                                   .withColumn('etl_action_cd',f.lit('I'))\
+                                   .withColumn('etl_load_dt',f.current_date())\
+                                   .withColumn('etl_load_ts',f.current_timestamp())\
+                                   .drop(*hash_column_list)
+
+    df_update_rec = df_src_hash_val.alias('s').join(df_tgt_hash_val.alias('t'),
+                                                    [f.col('s.hash_key') == f.col('t.hash_key')],
+                                                    how='inner') \
+                                   .filter(f.col('s.hash_diff')!=f.col('t.hash_diff')) \
+                                   .select(['s.*']) \
+                                   .withColumn('etl_action_cd',f.lit('D')) \
+                                   .drop(*upsert_column_drop_list) \
+                                   .withColumn('etl_load_dt',f.current_date()) \
+                                   .withColumn('etl_load_ts',f.current_timestamp())
+
+    df_final = df_insert_rec.union(df_update_rec)
+    return df_final
+  
+  # Snippet for Historical Table/Incremental key merge load i.e. SCD type 2 table
+  else:
+    src_list = ['IAM_ENHANCED_FILE','CHUB_OptInOut_TABLE_ORACLE','IDW_TABLE_TERADATA','IDW_TABLE_SNOWFLAKE']
+    # If source effective start date column is mentioned
+    if src_system in src_list:
+      print('Inside manual eff date derivation control.')
+      # Exclusive logic for IAM
+      if src_system == "IAM_ENHANCED_FILE":
+        print("Logic for IAM")
+        # Identify completely new records
+        df_insert_rec = df_src_hash_val.alias('s') \
+                                      .join(df_tgt_hash_val.alias('t'), \
+                                            [f.col('s.hash_key') == f.col('t.hash_key')],\
+                                            how='leftouter') \
+                                      .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                      .withColumn("tgt_consent_date",f.col("t." + src_eff_start_date_col)) \
+                                      .withColumn("tgt_active_sub_flag",f.col('t.active_sub_flag')) \
+                                      .select(['s.*',"tgt_consent_date","tgt_active_sub_flag"]) \
+                                      .withColumn('etl_action_cd',f.lit('I')) \
+                                      .withColumn('effective_start_dt', f.when((f.col("tgt_active_sub_flag") == 'N') \
+                                                                              & (f.col(src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            == f.col("tgt_consent_date").cast('date')), \
+                                                                            f.current_date()) \
+                                                                      .when((f.col("tgt_active_sub_flag") == 'N') \
+                                                                              & (f.col(src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            != f.col("tgt_consent_date").cast('date')), \
+                                                                            f.to_date(src_eff_start_date_col).cast('date')) \
+                                                                      .when(f.col(src_eff_start_date_col).cast('date')  \
+                                                                            == f.col("tgt_consent_date").cast('date'), \
+                                                                            f.current_date()) \
+                                                                          .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                      .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                      .withColumn('etl_create_ts',f.current_timestamp()) \
+                                      .withColumn('etl_change_ts',f.current_timestamp()) \
+                                      .withColumn('active_sub_flag',f.lit('Y')) \
+                                      .withColumn('rec_valid_start_date',f.when((f.col("tgt_active_sub_flag") == 'N') \
+                                                                              & (f.col(src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            == f.col("tgt_consent_date").cast('date')), \
+                                                                            f.current_date()) \
+                                                                      .when((f.col("tgt_active_sub_flag") == 'N') \
+                                                                              & (f.col(src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            != f.col("tgt_consent_date").cast('date')), \
+                                                                            f.to_date(src_eff_start_date_col).cast('date')) \
+                                                                      .when((f.col("tgt_active_sub_flag") == 'Y') \
+                                                                            & (f.col(src_eff_start_date_col).cast('date')  \
+                                                                            == f.col("tgt_consent_date").cast('date')), \
+                                                                            f.col(src_eff_start_date_col).cast("date")) \
+                                                                          .otherwise(f.col(src_eff_start_date_col).cast("date"))) \
+                                      .withColumn('rec_valid_end_date',f.lit(None).cast('date')) \
+                                      .withColumn('consent_start_date',f.col(src_eff_start_date_col).cast("date")) \
+                                      .withColumn('consent_end_date',f.lit(None).cast('date')) \
+                                      .drop("tgt_consent_date","tgt_active_sub_flag") \
+                                      .drop(*hash_column_list) \
+                                      .select(*hist_tbl_clmns)
+        print('Insert data count:',df_insert_rec.count())
+
+        # Update in existing records
+        df_update_rec = df_src_hash_val.alias('s') \
+                                      .join(df_tgt_hash_val.alias('t'), \
+                                                        [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                        how='inner') \
+                                      .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                      .select('t.*', f.col('s.' + src_eff_start_date_col).alias('tmp_eff_col')) \
+                                      .withColumn('rec_valid_start_date', f.col('t.rec_valid_start_date')) \
+                                      .withColumn('consent_start_date',f.to_date(f.col('t.consent_start_date'))) \
+                                      .withColumn('rec_valid_end_date',f.when((f.col("t.active_sub_flag") == 'N') \
+                                                                              & (f.col('t.' + src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            == f.col("tmp_eff_col").cast('date')), \
+                                                                            f.current_date()) \
+                                                                      .when((f.col("t.active_sub_flag") == 'N') \
+                                                                              & (f.col('t.' + src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            != f.col("tmp_eff_col").cast('date')), \
+                                                                            f.to_date(f.col('tmp_eff_col'))) \
+                                                                      .when(f.col('t.' + src_eff_start_date_col).cast('date')  \
+                                                                            == f.col("tmp_eff_col").cast('date'), \
+                                                                            f.lit(None).cast('date')) \
+                                                                      .otherwise(f.to_date(f.col('tmp_eff_col')))) \
+                                      .withColumn('consent_end_date',f.when(f.col('t.' + src_eff_start_date_col).cast('date')  \
+                                                                            == f.col("tmp_eff_col").cast('date'), \
+                                                                            f.lit(None).cast('date')) \
+                                                                      .otherwise(f.to_date(f.col('tmp_eff_col')))) \
+                                      .withColumn('etl_action_cd',f.lit('D')) \
+                                      .withColumn('effective_start_dt',f.to_date(f.col('t.effective_start_dt'))) \
+                                      .withColumn('effective_end_dt',f.when((f.col("t.active_sub_flag") == 'N') \
+                                                                              & (f.col('t.' + src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            == f.col("tmp_eff_col").cast('date')), \
+                                                                            f.current_date()) \
+                                                                      .when((f.col("t.active_sub_flag") == 'N') \
+                                                                              & (f.col('t.' + src_eff_start_date_col) \
+                                                                                   .cast('date')  \
+                                                                            != f.col("tmp_eff_col").cast('date')), \
+                                                                            f.to_date(f.col('tmp_eff_col'))) \
+                                                                      .when((f.col("t.active_sub_flag") == 'Y') \
+                                                                            & (f.col('t.' + src_eff_start_date_col).cast('date')  \
+                                                                            == f.col("tmp_eff_col").cast('date')), \
+                                                                            f.current_date()) \
+                                                                      .when((f.col("t.active_sub_flag") == 'Y') \
+                                                                            & (f.col('t.' + src_eff_start_date_col).cast('date')  \
+                                                                            != f.col("tmp_eff_col").cast('date')), \
+                                                                            f.to_date(f.col('tmp_eff_col'))) \
+                                                                      .otherwise(f.lit(None).cast('date'))) \
+                                      .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                      .withColumn('etl_change_ts',f.current_timestamp()) \
+                                      .drop(*upsert_column_drop_list) \
+                                      .drop('tmp_eff_col') \
+                                      .select(*hist_tbl_clmns)
+        print('Update data count:',df_update_rec.count())
+        
+        df_del_ins = df_src_hash_val.alias('s') \
+                                      .join(df_tgt_hash_val.alias('t'), \
+                                            [f.col('s.hash_key') == f.col('t.hash_key')],\
+                                            how='rightOuter') \
+                                      .filter(f.col('s.hash_key').isNull()) \
+                                      .filter(f.col("t.active_sub_flag") == 'Y') \
+                                      .withColumn("src_consent_dt", f.col('s.' + src_eff_start_date_col)) \
+                                      .withColumn("tgt_consent_dt", f.col('t.' + src_eff_start_date_col)) \
+                                      .select('t.*', "src_consent_dt", "tgt_consent_dt") \
+                                      .withColumn("etl_action_cd", f.lit("I")) \
+                                      .withColumn("active_sub_flag",f.lit("N")) \
+                                      .withColumn("rec_valid_start_date", f.current_date()) \
+                                      .withColumn("rec_valid_end_date", f.lit(None).cast("date")) \
+                                      .withColumn("consent_start_date", f.col("tgt_consent_dt").cast("date")) \
+                                      .withColumn("consent_end_date", f.lit(None).cast("date")) \
+                                      .withColumn("effective_start_dt", f.current_date()) \
+                                      .withColumn("effective_end_dt", f.lit(None).cast("date")) \
+                                      .withColumn('etl_create_ts',f.current_timestamp()) \
+                                      .withColumn('etl_change_ts',f.current_timestamp()) \
+                                      .select(*hist_tbl_clmns)
+        print('Delete insert data count:',df_del_ins.count())
+        
+        df_del_upd = df_src_hash_val.alias('s') \
+                                      .join(df_tgt_hash_val.alias('t'), \
+                                            [f.col('s.hash_key') == f.col('t.hash_key')],\
+                                            how='rightOuter') \
+                                      .filter(f.col('s.hash_key').isNull()) \
+                                      .filter(f.col("t.active_sub_flag") == 'Y') \
+                                      .withColumn("src_consent_dt", f.col('s.' + src_eff_start_date_col)) \
+                                      .withColumn("tgt_consent_dt", f.col('t.' + src_eff_start_date_col)) \
+                                      .select('t.*', "src_consent_dt", "tgt_consent_dt") \
+                                      .withColumn("etl_action_cd", f.lit("D")) \
+                                      .withColumn("rec_valid_start_date", f.col('t.rec_valid_start_date')) \
+                                      .withColumn("rec_valid_end_date", f.current_date()) \
+                                      .withColumn("consent_start_date", f.col('t.consent_start_date')) \
+                                      .withColumn("consent_end_date", f.lit(None).cast("date")) \
+                                      .withColumn("effective_end_dt", f.current_date()) \
+                                      .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                      .withColumn('etl_change_ts',f.current_timestamp()) \
+                                      .select(*hist_tbl_clmns)
+        print('Delete update data count:',df_del_upd.count())
+
+        df_final = df_insert_rec.union(df_update_rec).union(df_del_ins).union(df_del_upd)
+
+        return df_final
+      
+      # Exclusive logic for CHUB and IDW
+      else:
+        if src_system == "CHUB_OptInOut_TABLE_ORACLE":
+          print("This is exclusively for CHUB")
+          if 'PARENTAL' in src_tbl_name.upper():
+            print("This logic is for PARENTAL only")
+            # Identify entirely new record
+            df_insert_rec = df_src_hash_val.alias('s') \
+                                          .join(df_tgt_hash_val.alias('t'), \
+                                                [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                how='leftouter') \
+                                          .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                          .withColumn("tgt_consent_date",f.col("t.CONSENT_PROVIDED_DATE")) \
+                                          .select(['s.*',"tgt_consent_date"]) \
+                                          .withColumn("src_consent_date", f.when(f.col("CONSENT_PROVIDED_DATE").isNull(), \
+                                                                                 f.col("CREATED")) \
+                                                                          .otherwise(f.col("CONSENT_PROVIDED_DATE"))) \
+                                          .withColumn("CONSENT_DATE_IS_NULL", f.when(f.col("CONSENT_PROVIDED_DATE").isNull(), \
+                                                                                          f.lit("Y")) \
+                                                                              .otherwise(f.lit("N"))) \
+                                          .withColumn("CONSENT_START_DATE", f.col("src_consent_date").cast("date")) \
+                                          .withColumn("CONSENT_END_DATE", f.lit(None).cast("date")) \
+                                          .withColumn('etl_action_cd',f.lit('I')) \
+                                          .withColumn('effective_start_dt', f.when(f.col("src_consent_date") <= \
+                                                                               f.col("tgt_consent_date"), \
+                                                                               f.current_date()) \
+                                                                          .otherwise(f.col("src_consent_date").cast("date"))) \
+                                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                                          .drop("src_consent_date","tgt_consent_date") \
+                                          .drop(*hash_column_list) \
+                                          .select(*hist_tbl_clmns)
+            print('Insert data count:',df_insert_rec.count())
+
+            # Identify change in existing records
+            df_update_rec = df_src_hash_val.alias('s') \
+                                           .join(df_tgt_hash_val.alias('t'), \
+                                                 [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                 how='inner' ) \
+                                           .filter(f.col('s.hash_diff')!=f.col('t.hash_diff')) \
+                                           .withColumn("tmp_eff_col",f.when(f.col('s.'+src_eff_start_date_col).isNull(), \
+                                                                           f.col("s.CREATED")) \
+                                                                      .otherwise(f.col('s.'+src_eff_start_date_col))) \
+                                           .withColumn("tmp_eff_col",f.when(f.col('s.'+src_eff_start_date_col).isNull(), \
+                                                                            f.col("s.CREATED")) \
+                                                                     .otherwise(f.col('s.'+src_eff_start_date_col))) \
+                                           .select('t.*','tmp_eff_col') \
+                                           .withColumn("CONSENT_DATE_IS_NULL", f.when(f.col("CONSENT_PROVIDED_DATE").isNull(), \
+                                                                                      f.lit("Y")) \
+                                                                                .otherwise(f.lit("N"))) \
+                                           .withColumn("CONSENT_START_DATE", f.when(f.col("CONSENT_PROVIDED_DATE").isNull(), \
+                                                                                    f.col("CREATED").cast("date")) \
+                                                                                .otherwise(f.col("CONSENT_PROVIDED_DATE") \
+                                                                                .cast("date"))) \
+                                           .withColumn("CONSENT_END_DATE", f.when(f.col("t.CONSENT_PROVIDED_DATE").cast("date") == \
+                                                                                  f.col("tmp_eff_col").cast("date"), \
+                                                                                  f.lit(None).cast("date")) \
+                                                                            .otherwise(f.col("tmp_eff_col").cast("date"))) \
+                                           .withColumn('etl_action_cd',f.lit('D')) \
+                                           .withColumn('effective_start_dt',f.to_date(f.col('t.effective_start_dt'))) \
+                                           .withColumn('effective_end_dt',f.when(f.col("t.CONSENT_PROVIDED_DATE").cast("date") == \
+                                                                                  f.col("tmp_eff_col").cast("date"), \
+                                                                                  f.current_date()) \
+                                                                            .otherwise(f.col("tmp_eff_col").cast("date"))) \
+                                           .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                           .withColumn('etl_change_ts',f.current_timestamp()) \
+                                           .drop(*upsert_column_drop_list) \
+                                           .drop('tmp_eff_col') \
+                                           .select(*hist_tbl_clmns)
+            print('Update data count:',df_update_rec.count())
+          
+          elif 'DNS' in src_tbl_name.upper():
+            print("This logic is for DNS only")
+            # Identify entirely new record
+            df_insert_rec = df_src_hash_val.alias('s') \
+                                          .join(df_tgt_hash_val.alias('t'),\
+                                                [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                how='leftouter') \
+                                          .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                          .withColumn("tgt_consent_date",f.col("t.DNS_SETTING_DT")) \
+                                          .select(['s.*',"tgt_consent_date"]) \
+                                          .withColumn('etl_action_cd',f.lit('I')) \
+                                          .withColumn('effective_start_dt', f.when(f.col("DNS_SETTING_DT") <= \
+                                                                               f.col("tgt_consent_date"), \
+                                                                               f.current_date()) \
+                                                                          .otherwise(f.col("DNS_SETTING_DT").cast("date"))) \
+                                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                                          .withColumn("CONSENT_START_DATE",f.to_date(f.col('DNS_SETTING_DT'))) \
+                                          .withColumn("CONSENT_END_DATE",f.lit(None).cast('date')) \
+                                          .drop("tgt_consent_date") \
+                                          .drop(*hash_column_list) \
+                                          .select(*hist_tbl_clmns)
+            print('Insert data count:',df_insert_rec.count())
+            
+            # Identify change in existing records
+            df_update_rec = df_src_hash_val.alias('s') \
+                                           .join(df_tgt_hash_val.alias('t'), \
+                                                 [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                  how='inner') \
+                                          .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                          .select('t.*', f.col('s.' + src_eff_start_date_col).alias('tmp_eff_col')) \
+                                          .withColumn('etl_action_cd',f.lit('D')) \
+                                          .withColumn('effective_start_dt',f.to_date(f.col('t.effective_start_dt'))) \
+                                          .withColumn('effective_end_dt',f.when(f.col(src_eff_start_date_col) >= \
+                                                                            f.col("tmp_eff_col"), \
+                                                                            f.current_date()) \
+                                                                          .otherwise(f.col("tmp_eff_col").cast("date"))) \
+                                          .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                                          .withColumn('CONSENT_START_DATE',f.to_date(f.col('DNS_SETTING_DT'))) \
+                                          .withColumn("CONSENT_END_DATE",f.to_date(f.col('tmp_eff_col'))) \
+                                          .drop(*upsert_column_drop_list) \
+                                          .drop('tmp_eff_col') \
+                                          .withColumn("CONSENT_END_DATE",f.when(f.col("CONSENT_START_DATE") == \
+                                                                                f.col("CONSENT_END_DATE"), \
+                                                                                f.lit(None).cast('date')) \
+                                                                          .otherwise(f.col("CONSENT_END_DATE"))) \
+                                          .select(*hist_tbl_clmns)
+            print('Update data count:',df_update_rec.count())
+            
+          elif 'CVM_CONTACTABILITY_LOG' in src_tbl_name.upper():
+            print('CVM_CONTACTABILITY_LOG')
+            hist_tbl_clmns.remove("CURR_IND")
+
+
+            df_insert_rec = df_src_hash_val.alias('s') \
+                                                     .join(df_tgt_hash_val.alias('t'), \
+                                                           [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                           how='left_outer' ) \
+                                                     .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                                     .withColumn("tgt_RULE_DATE",f.col("t." + src_eff_start_date_col)) \
+                                                     .select(['s.*',"tgt_RULE_DATE"]) \
+                                                     .withColumn('etl_action_cd',f.lit('I')) \
+                                                     .withColumn('RULE_START_DATE', f.when(f.col("RULE_DATE").cast("date") == \
+                                                                                             f.col("tgt_RULE_DATE").cast("date"), \
+                                                                                             f.col("tgt_RULE_DATE").cast("date")) \
+                                                                                        .otherwise(f.col("RULE_DATE").cast("date"))) \
+                                                     .withColumn('RULE_END_DATE',f.lit(None).cast('date')) \
+                                                     .withColumn('effective_start_dt', f.when(f.col("RULE_DATE").cast("date") == \
+                                                                                             f.col("tgt_RULE_DATE").cast("date"), \
+                                                                                             f.current_date()) \
+                                                                                        .otherwise(f.col("RULE_DATE").cast("date"))) \
+                                                     .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                                     .withColumn('etl_create_ts',f.current_timestamp()) \
+                                                     .withColumn('etl_change_ts',f.current_timestamp()) \
+                                                     .drop("tgt_RULE_DATE") \
+                                                     .drop(*hash_column_list) \
+                                                      .select(*hist_tbl_clmns)
+
+            print(f"Insert records count: {df_insert_rec.count()}")
+
+            df_update_rec = df_src_hash_val.alias('s') \
+                                                     .join(df_tgt_hash_val.alias('t'), \
+                                                           [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                           how='inner' ) \
+                                                     .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                                     .withColumn("src_RULE_DATE",f.col("s." + src_eff_start_date_col)) \
+                                                     .select(['t.*',"src_RULE_DATE"]) \
+                                                     .withColumn('etl_action_cd',f.lit('D')) \
+                                                     .withColumn('RULE_START_DATE',f.col('RULE_START_DATE')) \
+                                                     .withColumn('RULE_END_DATE',f.when(f.col("RULE_DATE").cast("date") == \
+                                                                                          f.col("src_RULE_DATE").cast("date"), \
+                                                                                          f.lit(None).cast('date')) \
+                                                                                     .otherwise(f.col("src_RULE_DATE").cast("date"))) \
+                                                     .withColumn('effective_start_dt',f.col('t.effective_start_dt')) \
+                                                     .withColumn('effective_end_dt',f.when(f.col("RULE_DATE").cast("date") == \
+                                                                                          f.col("src_RULE_DATE").cast("date"), \
+                                                                                          f.current_date()) \
+                                                                                     .otherwise(f.col("src_RULE_DATE").cast("date"))) \
+                                                     .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                                     .withColumn('etl_change_ts',f.current_timestamp()) \
+                                                  .withColumn("RULE_END_DATE",f.when(f.col("RULE_END_DATE") ==\
+                                                                                        f.col("RULE_START_DATE") \
+                                                                                        ,f.lit(None).cast('date'))\
+                                                                .otherwise(f.col("RULE_END_DATE"))) \
+                                                     .drop("src_RULE_DATE") \
+                                                     .drop(*hash_column_list)\
+                                                     .select(*hist_tbl_clmns)
+
+            print(f"Update records count: {df_update_rec.count()}")
+
+            df_final = df_insert_rec.union(df_update_rec)
+            return df_final
+          
+          else:
+            print("This logic is for other CHUB tables except PARENTAL and DNS")
+            # Identify entirely new record
+            df_insert_rec = df_src_hash_val.alias('s') \
+                                          .join(df_tgt_hash_val.alias('t'),\
+                                                [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                how='leftouter') \
+                                          .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                          .withColumn("tgt_consent_date",f.col("t.CONSENT_PROVIDED_DATE")) \
+                                          .select(['s.*',"tgt_consent_date"]) \
+                                          .withColumn('etl_action_cd',f.lit('I')) \
+                                          .withColumn('effective_start_dt', f.when(f.col("CONSENT_PROVIDED_DATE") <= \
+                                                                               f.col("tgt_consent_date"), \
+                                                                               f.current_date()) \
+                                                                          .otherwise(f.col("CONSENT_PROVIDED_DATE").cast("date"))) \
+                                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                                          .withColumn("CONSENT_START_DATE",f.to_date(f.col('CONSENT_PROVIDED_DATE'))) \
+                                          .withColumn("CONSENT_END_DATE",f.lit(None).cast('date')) \
+                                          .drop("tgt_consent_date") \
+                                          .drop(*hash_column_list) \
+                                          .select(*hist_tbl_clmns)
+            print('Insert data count:',df_insert_rec.count())
+            
+            # Identify change in existing records
+            df_update_rec = df_src_hash_val.alias('s') \
+                                           .join(df_tgt_hash_val.alias('t'), \
+                                                 [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                                  how='inner') \
+                                          .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                          .select('t.*', f.col('s.' + src_eff_start_date_col).alias('tmp_eff_col')) \
+                                          .withColumn('etl_action_cd',f.lit('D')) \
+                                          .withColumn('effective_start_dt',f.to_date(f.col('t.effective_start_dt'))) \
+                                          .withColumn('effective_end_dt',f.when(f.col(src_eff_start_date_col) >= \
+                                                                            f.col("tmp_eff_col"), \
+                                                                            f.current_date()) \
+                                                                          .otherwise(f.col("tmp_eff_col").cast("date"))) \
+                                          .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                                          .withColumn('CONSENT_START_DATE',f.to_date(f.col('CONSENT_PROVIDED_DATE'))) \
+                                          .withColumn("CONSENT_END_DATE",f.to_date(f.col('tmp_eff_col'))) \
+                                          .drop(*upsert_column_drop_list) \
+                                          .drop('tmp_eff_col') \
+                                          .withColumn("CONSENT_END_DATE",f.when(f.col("CONSENT_START_DATE") == \
+                                                                                f.col("CONSENT_END_DATE"), \
+                                                                                f.lit(None).cast('date')) \
+                                                                          .otherwise(f.col("CONSENT_END_DATE"))) \
+                                          .select(*hist_tbl_clmns)
+            print('Update data count:',df_update_rec.count())
+          df_final = df_insert_rec.union(df_update_rec)
+          return df_final
+        else:
+          print("This is exclusively for IDW")
+          df_insert_rec = df_src_hash_val.alias('s') \
+                                         .join(df_tgt_hash_val.alias('t'), \
+                                               [f.col('s.hash_key') == f.col('t.hash_key'), \
+                                                f.col('s.hash_diff') == f.col('t.hash_diff')], \
+                                               how='left_anti' ) \
+                                         .withColumn('etl_action_cd',f.lit('I')) \
+                                         .withColumn('effective_start_dt',f.to_date(f.col('s.'+src_eff_start_date_col)))\
+                                         .withColumn('effective_end_dt',f.lit(None).cast('date'))\
+                                         .withColumn('etl_create_ts',f.current_timestamp())\
+                                         .withColumn('etl_change_ts',f.current_timestamp())\
+                                         .drop(*hash_column_list)
+          print('Insert data count:',df_insert_rec.count())
+          df_update_rec = df_src_hash_val.alias('s') \
+                                         .join(df_tgt_hash_val.alias('t'), \
+                                               [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                               how='inner' ) \
+                                         .filter(f.col('s.hash_diff')!=f.col('t.hash_diff')) \
+                                         .select('t.*',f.col('s.'+src_eff_start_date_col).alias('tmp_eff_col'))\
+                                         .withColumn('etl_action_cd',f.lit('D'))\
+                                         .withColumn('effective_start_dt',f.to_date(f.col('t.effective_start_dt')))\
+                                         .withColumn('effective_end_dt',f.to_date(f.col('tmp_eff_col')))\
+                                         .withColumn('etl_create_ts',f.col('t.etl_create_ts'))\
+                                         .withColumn('etl_change_ts',f.current_timestamp())\
+                                         .drop(*upsert_column_drop_list)\
+                                         .drop('tmp_eff_col')
+          print('Update data count:',df_update_rec.count())
+        
+        df_final = df_insert_rec.union(df_update_rec)
+        return df_final
+    # If source effective start date column is not mentioned
+    else:
+      # Exclusive logic for CDPM and BMW
+      if ('CDPM' in src_system) or ('BMW' in src_system):
+        print("This is CDPM or BMW")
+        # Identify completely new records
+        df_insert_rec = df_src_hash_val.alias('s') \
+                                       .join(df_tgt_hash_val.alias('t'), \
+                                             [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                             how='leftouter' ) \
+                                       .filter(f.col("t.hash_diff").isNull() | (f.col("s.hash_diff") != f.col("t.hash_diff"))) \
+                                       .withColumn("tgt_consent_date",f.col("t.Consent_Start_Date")) \
+                                       .select(['s.*',"tgt_consent_date"]) \
+                                       .withColumn("Consent_End_Date",f.lit(None).cast('timestamp')) \
+                                       .withColumn('etl_action_cd',f.lit('I')) \
+                                       .withColumn('effective_start_dt', f.when(f.col("Consent_Start_Date") <= \
+                                                                               f.col("tgt_consent_date"), \
+                                                                               f.current_date()) \
+                                                                          .otherwise(f.col("Consent_Start_Date").cast("date"))) \
+                                       .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                       .withColumn('etl_create_ts',f.current_timestamp()) \
+                                       .withColumn('etl_change_ts',f.current_timestamp()) \
+                                       .drop("tgt_consent_date") \
+                                       .drop(*hash_column_list)
+        print(f"Insert records count: {df_insert_rec.count()}")
+        
+        # Identify changes in the existing records
+        df_update_rec = df_src_hash_val.alias('s') \
+                                       .join(df_tgt_hash_val.alias('t'), \
+                                             [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                             how='inner' ) \
+                                       .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                       .withColumn("src_consent_date",f.col("s.Consent_Start_Date")) \
+                                       .select(['t.*',"src_consent_date"]) \
+                                       .withColumn("Consent_End_Date",f.when(f.col("Consent_Start_Date") >= \
+                                                                            f.col("src_consent_date"), \
+                                                                            f.lit(None).cast("date")) \
+                                                                       .otherwise(f.col("src_consent_date"))) \
+                                       .withColumn('etl_action_cd',f.lit('D')) \
+                                       .withColumn('effective_start_dt',f.col('t.effective_start_dt')) \
+                                       .withColumn('effective_end_dt',f.when(f.col("Consent_Start_Date") >= \
+                                                                            f.col("src_consent_date"), \
+                                                                            f.current_date()) \
+                                                                       .otherwise(f.col("src_consent_date").cast("date"))) \
+                                       .withColumn('etl_create_ts',f.col('t.etl_create_ts')) \
+                                       .withColumn('etl_change_ts',f.current_timestamp()) \
+                                       .drop("src_consent_date") \
+                                       .drop(*upsert_column_drop_list)
+        print(f"Update records count: {df_update_rec.count()}")
+        
+        df_final = df_insert_rec.union(df_update_rec)
+        return df_final
+      # Logic for rest other source systems  
+      else:
+        print("This is others")
+        df_insert_rec = df_src_hash_val.alias('s') \
+                                       .join(df_tgt_hash_val.alias('t'), \
+                                             [f.col('s.hash_key') == f.col('t.hash_key'), \
+                                              f.col('s.hash_diff') == f.col('t.hash_diff')], \
+                                             how='left_anti' ) \
+                                       .withColumn('etl_action_cd',f.lit('I')) \
+                                       .withColumn('effective_start_dt',f.current_date()) \
+                                       .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                       .withColumn('etl_create_ts',f.current_timestamp()) \
+                                       .withColumn('etl_change_ts',f.current_timestamp()) \
+                                       .drop(*hash_column_list)
+        print(f"Insert records count: {df_insert_rec}")
+
+        df_update_rec = df_src_hash_val.alias('s') \
+                                       .join(df_tgt_hash_val.alias('t'), \
+                                             [f.col('s.hash_key') == f.col('t.hash_key')], \
+                                             how='inner' ) \
+                                       .filter(f.col('s.hash_diff') != f.col('t.hash_diff')) \
+                                       .select(['t.*']) \
+                                       .withColumn('etl_action_cd',f.lit('D')) \
+                                       .withColumn('effective_start_dt',f.col('t.effective_start_dt'))\
+                                       .withColumn('effective_end_dt',f.current_date())\
+                                       .withColumn('etl_create_ts',f.col('t.etl_create_ts'))\
+                                       .withColumn('etl_change_ts',f.current_timestamp())\
+                                       .drop(*upsert_column_drop_list)
+        print(f"Update records count: {df_update_rec}")
+        df_final = df_insert_rec.union(df_update_rec)
+    
+    print("Discover")
+    df_final = df_final.withColumn('effective_end_dt', \
+                                     f.when(f.col('etl_action_cd') == 'D', \
+                                           f.lag(f.col('effective_start_dt'),1) \
+                                            .over(Window.partitionBy(*key_column_list). \
+                                                  orderBy(f.col('effective_start_dt').desc()))) \
+                                      .otherwise(f.col('effective_end_dt')))
+    # df_final = df_insert_rec.union(df_update_rec)
+    # Logic for soft delete
+    tgt_col_list = df_final.columns
+    if 'SOFT-DELETE' in job_type:
+      drop_col_list = hash_column_list + ['etl_action_cd','effective_end_dt','etl_change_ts']
+      df_soft_delete_rec = df_tgt_hash_val.alias('t') \
+                                          .join(df_src_hash_val.alias('s'), \
+                                                [f.col('t.hash_key') == f.col('s.hash_key')], \
+                                                how='left_anti' ) \
+                                          .withColumn('etl_action_cd_tmp',f.lit('D')) \
+                                          .withColumn('effective_end_dt_tmp',f.current_date()-1) \
+                                          .withColumn('etl_change_ts_tmp',f.current_timestamp()) \
+                                          .drop(*drop_col_list) \
+                                          .withColumnRenamed('etl_action_cd_tmp','etl_action_cd') \
+                                          .withColumnRenamed('effective_end_dt_tmp','effective_end_dt') \
+                                          .withColumnRenamed('etl_change_ts_tmp','etl_change_ts') \
+                                          .select(*tgt_col_list)
+      df_final = df_final.union(df_soft_delete_rec)
+    return df_final
+
+
+def write_tgt_df(df_write,tgt_format,tgt_mode,tgt_location,key_column_list=None):
+  global snapshot_insert_cnt
+  global hist_insert_cnt
+  global hist_update_cnt
+  print('loading into tgt location: ',tgt_location)
+  if 'merge' not in tgt_mode:
+    snapshot_insert_cnt = str(df_write.count())
+    if "_hist" in tgt_location:
+      hist_insert_cnt = snapshot_insert_cnt
+    print(f"{tgt_mode}ing {snapshot_insert_cnt} records on {tgt_location}")
+    df_write.write.format(tgt_format).mode(tgt_mode).save(tgt_location)
+  if 'merge' in tgt_mode:
+    merge_condition_str = ' and '.join(['t.'+c+'= s.'+c for c in key_column_list]) 
+    
+    tbl_tgt = DeltaTable.forPath(spark,tgt_location)
+    df_tgt = tbl_tgt.toDF()
+    
+    update_key_list = [c for c in df_tgt.columns if c not in key_column_list]
+    update_val_list = ['s.'+c for c in update_key_list]
+    update_dict = dict(zip(update_key_list,update_val_list))
+
+    insert_key_list = [c for c in df_tgt.columns]
+    insert_val_list = ['s.'+c for c in insert_key_list]
+    insert_dict = dict(zip(insert_key_list,insert_val_list))
+    
+    df_src_update=df_write.filter("etl_action_cd!='I'")
+    df_src_insert=df_write.filter("etl_action_cd=='I'")
+    
+    hist_insert_cnt = str(df_src_insert.count())
+    hist_update_cnt = str(df_src_update.count())
+    snapshot_insert_cnt = hist_insert_cnt
+    
+    print(f"Insert count: {hist_insert_cnt}")
+    print(f"Update count: {hist_update_cnt}")
+    
+    if "_hist" in tgt_location:
+      merge_condition_str = merge_condition_str+" and t.etl_action_cd='I'"
+    else:
+      df_src_update = df_src_update.drop('etl_action_cd')
+      df_src_insert = df_src_insert.drop('etl_action_cd')
+    
+    print(f"Updating {df_src_update.count()} records on {tgt_location}")
+    tbl_tgt.alias('t')\
+      .merge(df_src_update.alias('s'),
+            merge_condition_str
+            )\
+      .whenMatchedUpdate(set = update_dict)\
+    .execute()
+    
+    print(f"Inserting {df_src_insert.count()} records on {tgt_location}")
+    df_src_insert.write.format(tgt_format).mode('append').save(tgt_location)
+
+
+def truncate_load_history(df_src,key_column_list,src_system,eff_start_dt_col=None):
+  i360_non_mkt_cnsts_tbls = ['PAD_TABLE_i360','PRA_TABLE_i360','PRI_TABLE_i360', \
+                            'FP_TABLE_i360','FM_TABLE_i360', \
+                            'BIOMETRIC_TABLE_i360','PARENTAL_TABLE_i360']
+  if 'TMT' in src_system:
+    print("Creating ETL Columns for TMT Table")
+    df = df_src.withColumn('etl_action_cd',f.lit('I')) \
+               .withColumn('effective_start_dt',f.to_date(f.col("CREATED_ON_DATE"))) \
+               .withColumn('effective_end_dt',f.lit(None)) \
+               .withColumn('etl_create_ts',f.current_timestamp()) \
+               .withColumn('etl_change_ts',f.current_timestamp()) \
+               .withColumn('etl_action_cd',f.when(f.lead('effective_start_dt',1) \
+                                                   .over(Window.partitionBy(*["MSISDN","DEVICEID"]) \
+                                                               .orderBy(f.col("CREATED_ON_DATE"))).isNull() \
+                                            ,f.lit('I')) \
+                                            .otherwise(f.lit('D'))) \
+               .withColumn('effective_end_dt',f.when(f.lead('effective_start_dt',1) \
+                                                      .over(Window.partitionBy(*["MSISDN","DEVICEID"]) \
+                                                                  .orderBy(f.col("CREATED_ON_DATE"))).isNotNull() \
+                                             ,f.lead('effective_start_dt',1)
+                                               .over(Window.partitionBy(*["MSISDN","DEVICEID"]) \
+                                               .orderBy(f.col("CREATED_ON_DATE")))) \
+                                               .otherwise(f.lit(None).cast('date')))
+    return df
+  elif 'DNS_TABLE_i360' in src_system:
+    print("Creating ETL Columns for DNS Table")
+    df = df_src.withColumn('etl_action_cd',f.lit('I')) \
+               .withColumn('effective_start_dt',f.to_date(f.col("DNS_SETTING_DT"))) \
+               .withColumn('effective_end_dt',f.lit(None)) \
+               .withColumn('etl_create_ts',f.current_timestamp()) \
+               .withColumn('etl_change_ts',f.current_timestamp()) \
+               .withColumn('etl_action_cd',f.when(f.lead('effective_start_dt',1) \
+                                                   .over(Window.partitionBy(*["BAN","MSISDN"]) \
+                                                               .orderBy(f.col("DNS_SETTING_DT"))).isNull() \
+                                            ,f.lit('I')) \
+                                            .otherwise(f.lit('D'))) \
+               .withColumn('effective_end_dt',f.when(f.lead('effective_start_dt',1) \
+                                                      .over(Window.partitionBy(*["BAN","MSISDN"]) \
+                                                                  .orderBy(f.col("DNS_SETTING_DT"))).isNotNull() \
+                                             ,f.lead('effective_start_dt',1)
+                                               .over(Window.partitionBy(*["BAN","MSISDN"]) \
+                                               .orderBy(f.col("DNS_SETTING_DT")))) \
+                                               .otherwise(f.lit(None).cast('date')))
+    return df
+  elif "CONT_HIST_TABLE_i360" in src_system:
+    print("Creating ETL Columns for Contact History Table")
+    df = df_src.withColumn('etl_action_cd',f.lit('I')) \
+               .withColumn('effective_start_dt',f.to_date(f.col("LOAD_DTTM"))) \
+               .withColumn('effective_end_dt',f.lit(None)) \
+               .withColumn('etl_create_ts',f.current_timestamp()) \
+               .withColumn('etl_change_ts',f.current_timestamp()) \
+               .withColumn('etl_action_cd',f.when(f.lead('effective_start_dt',1) \
+                                                   .over(Window.partitionBy(*["CNTCT_EVENT_SID"]) \
+                                                               .orderBy(f.col("LOAD_DTTM"))).isNull() \
+                                            ,f.lit('I')) \
+                                            .otherwise(f.lit('D'))) \
+               .withColumn('effective_end_dt',f.when(f.lead('effective_start_dt',1) \
+                                                      .over(Window.partitionBy(*["CNTCT_EVENT_SID"]) \
+                                                                  .orderBy(f.col("LOAD_DTTM"))).isNotNull() \
+                                             ,f.lead('effective_start_dt',1)
+                                               .over(Window.partitionBy(*["CNTCT_EVENT_SID"]) \
+                                               .orderBy(f.col("LOAD_DTTM")))) \
+                                               .otherwise(f.lit(None).cast('date')))
+    return df
+  elif src_system in i360_non_mkt_cnsts_tbls:
+    print("Creating ETL Columns for Marketing Consents Table")
+    df = df_src.withColumn('etl_action_cd',f.lit('I')) \
+               .withColumn('effective_start_dt',f.to_date(f.col("CONSENT_PROVIDED_DATE"))) \
+               .withColumn('effective_end_dt',f.lit(None)) \
+               .withColumn('etl_create_ts',f.current_timestamp()) \
+               .withColumn('etl_change_ts',f.current_timestamp()) \
+               .withColumn('etl_action_cd',f.when(f.lead('effective_start_dt',1) \
+                                                   .over(Window.partitionBy(*["ACCNT_NUM","CONSENT_MSISDN"]) \
+                                                               .orderBy(f.col("CONSENT_PROVIDED_DATE"))).isNull() \
+                                            ,f.lit('I')) \
+                                            .otherwise(f.lit('D'))) \
+               .withColumn('effective_end_dt',f.when(f.lead('effective_start_dt',1) \
+                                                      .over(Window.partitionBy(*["ACCNT_NUM","CONSENT_MSISDN"]) \
+                                                                  .orderBy(f.col("CONSENT_PROVIDED_DATE"))).isNotNull() \
+                                             ,f.lead('effective_start_dt',1)
+                                               .over(Window.partitionBy(*["ACCNT_NUM","CONSENT_MSISDN"]) \
+                                               .orderBy(f.col("CONSENT_PROVIDED_DATE")))) \
+                                               .otherwise(f.lit(None).cast('date')))
+    return df
+  else:
+    print("Creating ETL Columns...")
+    partition = Window.partitionBy(*[key_column_list]).orderBy(f.col(eff_start_dt_col))
+    df = df_src.withColumn('etl_action_cd',f.lit('I')) \
+               .withColumn('effective_start_dt',f.to_date(f.col(eff_start_dt_col))) \
+               .withColumn('effective_end_dt',f.lit(None)) \
+               .withColumn('etl_create_ts',f.current_timestamp()) \
+               .withColumn('etl_change_ts',f.current_timestamp()) \
+               .withColumn('etl_action_cd',f.when(f.lead('effective_start_dt',1) \
+                                                   .over(partition).isNull() \
+                                            ,f.lit('I')) \
+                                            .otherwise(f.lit('D'))) \
+               .withColumn('effective_end_dt',f.when(f.lead('effective_start_dt',1) \
+                                                      .over(partition).isNotNull() \
+                                             ,f.lead('effective_start_dt',1)
+                                               .over(partition)) \
+                                               .otherwise(f.lit(None).cast('date')))
+    return df
+
+
+def src_de_duplicate_process(df,key_column_list,src_order_by_condn,src_system=None,is_3_day_hist=None):
+  global dedup_cnt, src_tbl_name
+  df_de_duplicate = df.dropDuplicates()
+  if is_3_day_hist:
+    if 'NOR' in src_system and 'service_agreement' in src_tbl_name.lower():
+      partition = Window.partitionBy(*key_column_list).orderBy(*[f.col(c).desc() for c in src_order_by_condn])
+      df_unique = df_de_duplicate.withColumn("EXPIRATION_DATE", f.when(f.col("EXPIRATION_DATE").isNull(), \
+                                                                 f.to_date(f.lit('2099-12-31'),'yyyy-MM-dd')) \
+                                                               .otherwise(f.col("EXPIRATION_DATE"))) \
+                                 .withColumn("diff", f.datediff("EFFECTIVE_DATE",f.lag("EXPIRATION_DATE",1) \
+                                                                                   .over(Window.partitionBy(*key_column_list) \
+                                                                  .orderBy(f.col('EFFECTIVE_DATE'))))) \
+                                 .withColumn("flag",f.when(f.col("diff") <= 3,0) \
+                                                     .otherwise(1)) \
+                                 .withColumn("grp",f.sum(f.col("flag")) \
+                                                    .over(Window.partitionBy(*key_column_list).orderBy(f.col('EFFECTIVE_DATE')))) \
+                                 .groupBy('BAN','SUBSCRIBER_NO','grp') \
+                                 .agg(f.max('SOC').alias('SOC'), \
+                                      f.max('SOC_SEQ_NO').alias('SOC_SEQ_NO'), \
+                                      f.max('OPERATOR_ID').alias('OPERATOR_ID'), \
+                                      f.max('APPLICATION_ID').alias('APPLICATION_ID'), \
+                                      f.max('DEALER_CODE').alias('DEALER_CODE'), \
+                                      f.min('EFFECTIVE_DATE').alias('EFFECTIVE_DATE'), \
+                                      f.max('EXPIRATION_DATE').alias('EXPIRATION_DATE')) \
+                                 .drop(f.col("grp")) \
+                                 .withColumn('EXPIRATION_DATE',f.when(f.col('EXPIRATION_DATE') <= f.current_date(), \
+                                                                      f.col('EXPIRATION_DATE')) \
+                                                                .otherwise(None))
+  else:
+    if len(src_order_by_condn) == 0:
+      df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                             .over(Window.partitionBy(*key_column_list) \
+                                                   .orderBy(f.lit(None))))\
+                                 .filter("rnk=1")\
+                                 .drop("rnk")
+    else:
+      if src_system and 'TMT' in src_system:
+        print("TMT Table")
+        df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                               .over(Window.partitionBy(*key_column_list) \
+                                                     .orderBy(*[f.lit(None)]))) \
+                                   .filter("rnk=1")\
+                                   .drop("rnk")
+      elif (src_system == 'CHUB_OptInOut_TABLE_ORACLE') and 'PARENTAL' in src_tbl_name.upper():
+        print("CHUB Parental Table")
+        df_de_duplicate = df_de_duplicate.withColumn("filter",f.when(f.col("CONSENT_PROVIDED_DATE").isNull(), \
+                                                                   f.to_date(f.col("CREATED"))) \
+                                                                   .otherwise(f.col("CONSENT_PROVIDED_DATE")))
+        df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                         .over(Window.partitionBy(*key_column_list) \
+                                               .orderBy(f.col("filter").desc(),f.col("LAST_UPD").desc()))) \
+                                                     .filter("rnk=1")\
+                                                     .drop("rnk","filter")
+      else:
+        print("Deduplicating common")
+        df_unique = df_de_duplicate.withColumn('rnk',f.row_number() \
+                                               .over(Window.partitionBy(*key_column_list) \
+                                                     .orderBy(*[f.col(c).desc() for c in src_order_by_condn]))) \
+                                   .filter("rnk=1")\
+                                   .drop("rnk")
+  dedup_cnt = str(df_unique.count())
+  return df_unique
+
+
+def generate_optin_rows(src_df):
+  partition = Window.partitionBy(*["BAN","SUBSCRIBER_NO"]).orderBy(*["EFFECTIVE_DATE"])
+  df2 = src_df.withColumn("SOC",f.lit("GLBOPTIN")) \
+             .withColumn("NEXT_EFFECTIVE_DATE",f.col("EXPIRATION_DATE")) \
+             .withColumn("NEXT_EXPIRATION_DATE",f.lead("EFFECTIVE_DATE").over(partition)) \
+             .withColumn("EFFECTIVE_DATE",f.col("NEXT_EFFECTIVE_DATE")) \
+             .withColumn("EXPIRATION_DATE",f.col("NEXT_EXPIRATION_DATE")) \
+             .drop(*["NEXT_EFFECTIVE_DATE","NEXT_EXPIRATION_DATE"])
+  df = src_df.unionAll(df2)
+  return df
+
+def get_additional_attributes(src_df,key_column_list,src_system):
+  
+  diff_column_list = [x.lower() for x in src_df.columns if x.lower() not in key_column_list]
+  select_columns = key_column_list + ['ptn','brand','application_id','product_type','state','zip'] + diff_column_list
+  
+  ban = spark.table("nor.ban") \
+            .dropDuplicates() \
+            .alias("b")
+  
+  subs = spark.table("nor.subscriber") \
+             .dropDuplicates() \
+             .alias("s")
+  
+  subr = spark.table("nor.subscriber_rsource") \
+             .dropDuplicates() \
+             .alias("sr")
+  
+  add = spark.table("nor.address_data") \
+            .dropDuplicates() \
+            .alias("ad")
+  
+  anl = spark.table("nor.address_name_link") \
+            .dropDuplicates() \
+            .withColumn("rnk",f.row_number().over(Window.partitionBy(*[f.col("BAN"),\
+                                                         f.col("SUBSCRIBER_NO")]) \
+                                           .orderBy(f.col("EFFECTIVE_DATE").desc()))) \
+            .filter(f.col("rnk") == 1) \
+            .drop("rnk") \
+            .alias("anl")
+  
+  attr = subs.join(ban,[f.trim(f.col("s.CUSTOMER_BAN")) == f.trim(f.col("b.BAN"))],"left") \
+            .join(subr,[(f.trim(f.col("s.CUSTOMER_BAN")) == f.trim(f.col("sr.ban"))), \
+                        (f.trim(f.col("s.SUBSCRIBER_NO")) == f.trim(f.col("sr.SUBSCRIBER_NO")))],"left") \
+            .join(anl,[(f.trim(f.col("s.CUSTOMER_BAN")) == f.trim(f.col("anl.ban"))), \
+                       (f.trim(f.col("s.SUBSCRIBER_NO")) == f.trim(f.col("anl.SUBSCRIBER_NO")))],"left") \
+            .join(add,[(f.trim(f.col("anl.ADDRESS_ID")) == f.trim(f.col("ad.ADDRESS_ID")))],"left") \
+            .select([f.col("s.CUSTOMER_BAN").alias("ban"), \
+                     f.col("s.SUBSCRIBER_NO").alias("subscriber_no"), \
+                     f.col("sr.PTN").alias("ptn"), \
+                     f.col("b.BRAND_CODE").alias("brand"), \
+                     f.col("s.APPLICATION_ID").alias("application_id"), \
+                     f.col("s.PRODUCT_TYPE").alias("product_type"), \
+                     f.col("ad.ADR_STATE_CODE").alias("state"), \
+                     f.col("ad.ADR_ZIP").alias("zip"), \
+                    ])
+  
+  attr.cache()
+  
+  if 'NOR' in src_system:
+    diff_column_list.remove('application_id')
+    select_columns = ['src.' + x for x in key_column_list] + \
+                     ['atr.ptn','atr.brand','atr.application_id','atr.product_type','atr.state','atr.zip'] + \
+                     ['src.' + x for x in diff_column_list]
+    df = src_df.alias("src").join(attr.alias("atr"), \
+                                  [(f.trim(f.col("src.ban")) == f.trim(f.col("atr.ban"))), \
+                                   (f.trim(f.col("src.subscriber_no")) == f.trim(f.col("atr.subscriber_no")))
+                                  ], "left") \
+              .select(select_columns)
+  elif ('CDPM' in src_system) or ('BMW' in src_system):
+    if ('CDPM' in src_system):
+      diff_column_list.remove('ptn')
+      select_columns = ['src.' + x for x in key_column_list] + \
+                     ['src.ptn', 'atr.brand', 'atr.application_id', 'atr.product_type', 'atr.state', 'atr.zip'] + \
+                     ['src.' + x for x in diff_column_list]
+      df = src_df.alias("src").join(attr.alias("atr"), \
+                                    [(f.trim(f.col("src.BAN")) == f.trim(f.col("atr.ban"))), \
+                                     (f.trim(f.col("src.Subscriber_Id")) == f.trim(f.col("atr.subscriber_no")))
+                                    ], "left") \
+                .select(select_columns)
+    elif ('BMW' in src_system):
+      diff_column_list.remove('tmay_ptn_nbr'.lower())
+      select_columns = ['src.' + x for x in key_column_list] + \
+                     ['src.TMAY_PTN_NBR', 'atr.brand', 'atr.application_id', 'atr.product_type', 'atr.state', 'atr.zip'] + \
+                     ['src.' + x for x in diff_column_list]
+      df = src_df.alias("src").join(attr.alias("atr"), \
+                                    [(f.trim(f.col("src.TMAY_BAN_NBR")) == f.trim(f.col("atr.ban"))), \
+                                     (f.trim(f.col("src.TMAY_SBSCR_NBR")) == f.trim(f.col("atr.subscriber_no")))
+                                    ], "left") \
+                .select(select_columns)
+  return df
+
+try:
+  if 'FILE' in src_system:
+    if 'MERGEFILE' in src_type:
+      src_path = f"{source_path}/*"
+    else:
+      src_path = f"{source_path}/{file_name}"
+    print('Reading data from source path:',src_path)
+    if ('CDPM' in src_system or 'IAM_ENHANCED_FILE' in src_system):
+      df_src = read_src_data(src_system,src_path,filter_condn=src_filter_condn,src_delimiter=src_delim,src_header=src_hdr)
+      if 'CDPM' in src_system:
+        df_tgt_snapshot_col_list = read_tgt_delta(snapshot_tbl_name + "_stg",filter_condition='1=2')
+      else:
+        df_tgt_snapshot_col_list = read_tgt_delta(snapshot_tbl_name,filter_condition='1=2')
+    else:
+      df_src = read_src_data(src_system,src_path,src_delimiter=src_delim,src_header=src_hdr) 
+      df_tgt_snapshot_col_list = read_tgt_delta(snapshot_tbl_name,filter_condition='1=2')
+    src_col_list = df_tgt_snapshot_col_list.columns[:-2]
+    if 'ONETRUST_DSR_FILE' in src_system.upper():
+      src_col_list.remove("file_name")
+      src_col_list.remove("Request_ID")
+      src_col_list.append("Ref_value")
+      src_col_list.append("Request_ID")
+      src_col_list.append("file_name")
+    df_src = df_src.toDF(*src_col_list)
+  if 'TABLE' in src_system:
+    print(src_tbl_name)
+
+    if len(src_tbl_name.split(',')) > 1:
+
+      src_tbl_name = src_tbl_name.split(',')
+
+      tmp_write_path_src_list = tmp_write_path.split('/')
+      tmp_write_path_src_list.append('src_tem')
+      tmp_write_path_src = "/".join(tmp_write_path_src_list)
+      print(tmp_write_path_src)
+
+      df_colum = spark.sql(f"select * from {hist_tbl_name}").columns[:-5]
+
+      for table_name in src_tbl_name:
+        print(table_name)
+        df_src_stage=read_src_data(src_system,table_name,filter_condn=src_filter_condn,select_columns=select_columns)
+        for column in [column for column in df_colum if column not in df_src_stage.columns]:
+          df_src_stage = df_src_stage.withColumn(column, f.lit('None'))
+        df_src_stage.write.format("parquet").mode("append").save(tmp_write_path_src)
+      
+      df_src_sta=spark.read.format('parquet').load(tmp_write_path_src)
+      df_src = df_src_sta.select(*df_colum)
+      src_tbl_name = ",".join(src_tbl_name)
+
+    else:
+      print(src_tbl_name)
+      df_src=read_src_data(src_system,src_tbl_name,filter_condn=src_filter_condn,select_columns=select_columns)
+
+  print(f"Source data count: {df_src.cache().count()}")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+if df_src.count() == 0:
+  logger.info(f"No source data available")
+  dbutils.notebook.exit("No source data available")
+
+#Encryption Code
+try:
+  df_src.createOrReplaceTempView('df_src_vw')
+  encr_col_list = df_src.columns
+  final_col = [encr_dict[c]+' as '+c if c in encr_dict else c for c in encr_col_list]
+  select_col=','.join(final_col)
+  encr_qry= f"select {select_col} from df_src_vw"
+  print('encr_qry:',encr_qry)
+  df_src=spark.sql(encr_qry)
+  df_src.createOrReplaceTempView('df_src_encrpt_vw')
+  spark.conf.set('tmp_write_path',tmp_write_path)
+  dbutils.fs.mkdirs(tmp_write_path)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+%scala
+val tmp_write_path_scala=spark.conf.get("tmp_write_path")
+print(tmp_write_path_scala)
+var df_encrpt_scala=spark.sql("select * from df_src_encrpt_vw")
+df_encrpt_scala.write.format("parquet").mode("overwrite").save(tmp_write_path_scala)
+
+
+try:
+  df_src=spark.read.format('parquet').load(f"{tmp_write_path}")
+  raw_cnt = df_src.count()
+  df_raw_parquet = df_src.select([f.col(col).alias(col.replace(' ','_')) for col in df_src.columns])
+  write_tgt_df(df_raw_parquet,'parquet','overwrite',raw_archive_path)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+try:
+  if src_order_by_condn:
+    if (src_system == 'CHUB_OptInOut_TABLE_ORACLE') and ('DNS' in src_tbl_name.upper()):
+      print("Dedup CHUB DNS")
+      df_src = src_de_duplicate_process(df_src,dedup_columns,src_order_by_condn + ['SUB_ID','TMO_ID'],src_system,is_3_day_hist)
+    else:
+      df_src = src_de_duplicate_process(df_src,dedup_columns,src_order_by_condn,src_system,is_3_day_hist)
+    print(f"Data count after dedup: {df_src.cache().count()}")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+try:
+  if ignore_rerun:
+    df_current_run = read_tgt_delta(snapshot_tbl_name,filter_condition="etl_load_dt=current_date")
+    rec_cnt = df_current_run.count()
+    print('rec_cnt:',rec_cnt)
+    if rec_cnt!=0:
+      df_src=df_src.filter("1=2")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+try:
+  if len(src_tbl_name.split(',')) > 1:
+
+    df_hist = df_src.withColumn('etl_action_cd',f.lit('I')) \
+      .withColumn('effective_start_dt',f.current_date()) \
+      .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+      .withColumn('etl_create_ts',f.current_timestamp()) \
+      .withColumn('etl_change_ts',f.current_timestamp())
+
+    df_tgt_hist=read_tgt_delta(hist_tbl_name,filter_condition='1=2')
+    df_hist=df_hist.select(*list(set(df_hist.columns).intersection(df_tgt_hist.columns)))
+    print(f"Count of records to write in historical table: {df_hist.count()}")
+    write_tgt_df(df_hist,'delta','append',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}")
+    
+  else:
+    if 'INCR-KEY-MERGE-LD' in hist_load_type:
+      if ('CDPM' in src_system) or ('BMW' in src_system):
+        df_tgt_hist_stg = read_tgt_delta(hist_tbl_name + "_stg",filter_condition="etl_action_cd='I'")
+        # df_hist_stg = incr_key_merge_process(df_src,df_tgt_hist_stg,key_column_list,hist_load_type,src_system)
+        # ====================================================================================================== #
+        # Code added for staging data to avoid merge logic issue failure
+        df_hist_stg_w = incr_key_merge_process(df_src,df_tgt_hist_stg,key_column_list,hist_load_type,src_system)
+        stg_path = f"{adlsRootPath}/{tgt_path.replace('processed','stage')}/{hist_tbl_path}_stg"
+        print(f"Staging data at: {stg_path}")
+        df_hist_stg_w.write.format("parquet").mode("overwrite").save(stg_path)
+        print(f"Reading data from: {stg_path}")
+        df_hist_stg = spark.read.format("parquet").load(stg_path)
+        # ====================================================================================================== #
+        print(f"Count of records to write in historical stage table: {df_hist_stg.cache().count()}")
+        write_tgt_df(df_hist_stg,'delta','merge',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}_stg",key_column_list)
+        
+        df_src_atr = get_additional_attributes(df_src,key_column_list,src_system)
+        df_tgt_hist = read_tgt_delta(hist_tbl_name,filter_condition="etl_action_cd='I'")
+        # df_hist = incr_key_merge_process(df_src_atr,df_tgt_hist,key_column_list,hist_load_type,src_system)
+        # ====================================================================================================== #
+        # Code added for staging data to avoid merge logic issue failure
+        df_hist_w = incr_key_merge_process(df_src_atr,df_tgt_hist,key_column_list,hist_load_type,src_system)
+        stg_path = f"{adlsRootPath}/{tgt_path.replace('processed','stage')}/{hist_tbl_path}"
+        print(f"Staging data at: {stg_path}")
+        df_hist_w.write.format("parquet").mode("overwrite").save(stg_path)
+        print(f"Reading data from: {stg_path}")
+        df_hist = spark.read.format("parquet").load(stg_path)
+        # ====================================================================================================== #
+        print(f"Count of records to write in historical table: {df_hist.cache().count()}")
+        write_tgt_df(df_hist,'delta','merge',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}",key_column_list)
+      else:
+        df_tgt_hist = read_tgt_delta(hist_tbl_name,filter_condition="etl_action_cd='I'")
+        # df_hist = incr_key_merge_process(df_src,df_tgt_hist,key_column_list,hist_load_type,src_system)
+        # ====================================================================================================== #
+        # Code added for staging data to avoid merge logic issue failure
+        df_hist_w = incr_key_merge_process(df_src,df_tgt_hist,key_column_list,hist_load_type,src_system)
+        stg_path = f"{adlsRootPath}/{tgt_path.replace('processed','stage')}/{hist_tbl_path}"
+        print(f"Staging data at: {stg_path}")
+        df_hist_w.write.format("parquet").mode("overwrite").save(stg_path)
+        print(f"Reading data from: {stg_path}")
+        df_hist = spark.read.format("parquet").load(stg_path)
+        # ====================================================================================================== #
+        print(f"Count of records to write in historical table: {df_hist.count()}")
+        if 'CVM_CONTACTABILITY_LOG' in src_tbl_name.upper():
+          df_hist = df_hist.withColumn('CURR_IND',f.lit('Y')).select(*[df_tgt_hist.columns])
+        write_tgt_df(df_hist,'delta','merge',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}",key_column_list)
+        if 'CVM_CONTACTABILITY_LOG' in src_tbl_name.upper():
+          df_hist = df_hist.withColumn('CURR_IND',f.lit('Y')).select(*[df_tgt_hist.columns])
+          print(f"Count of records to write in historical table: {df_hist.count()}")
+          write_tgt_df(df_hist,'delta','merge',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}",key_column_list)
+          src_order_by_condn.append("RULE_DATE")
+          src_order_by_condn.append("etl_change_ts")
+          print("src_order_by_condn", src_order_by_condn)
+
+          df_fin = spark.read.load(f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}")
+          df_fin = df_fin.withColumn('rnk',f.row_number() \
+                                            .over(Window.partitionBy(*key_column_list) \
+                                                  .orderBy(*[f.col(c).desc() for c in src_order_by_condn]))) \
+                                  .withColumn("CURR_IND",f.when(f.col("rnk") == 1,\
+                                                                f.lit("Y"))\
+                                              .otherwise(f.lit("N")))\
+                                              .drop("rnk").select(*[df_tgt_hist.columns])
+
+          df_fin.write.format("delta").mode('overwrite').save(f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}")
+          print("CVM Migaration done")
+    elif 'TRUNC-LD' in hist_load_type:
+      if 'NOR' in src_system:
+        df_full = generate_optin_rows(df_src)
+        df_hist_stg = truncate_load_history(df_full,key_column_list,src_system,src_eff_start_date_col)
+        print(f"Count of records to write in historical stage table: {df_hist_stg.count()}")
+        write_tgt_df(df_hist_stg,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{hist_tbl_path}_stg")
+        
+        df_hist = get_additional_attributes(df_hist_stg,key_column_list,src_system)
+        write_tgt_df(df_hist,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{hist_tbl_path}")
+      else:
+        df_hist = truncate_load_history(df_src,key_column_list,src_system)
+        print(f"Count of records to write in historical table: {df_hist.count()}")
+        write_tgt_df(df_hist,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{hist_tbl_path}")      
+    elif 'APPEND-LD' in hist_load_type:
+      if 'ONETRUST_DSR_FILE' in src_system.upper():
+        df_hist = df_src.withColumn("Delivery_Method_Dynamic_Data", f.when(f.col("Ref_value").isNotNull(),f.col("Ref_value"))\
+                                    .otherwise(f.col("Delivery_Method_Dynamic_Data"))) \
+                                    .drop("Ref_value")\
+                                    .withColumn('etl_action_cd',f.lit('I')) \
+                                    .withColumn('effective_start_dt',f.current_date()) \
+                                    .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                                    .withColumn('etl_create_ts',f.current_timestamp()) \
+                                    .withColumn('etl_change_ts',f.current_timestamp())
+        
+        df_tgt_hist=read_tgt_delta(hist_tbl_name,filter_condition='1=2')
+        df_hist=df_hist.toDF(*df_tgt_hist.columns)
+        print(f"Count of records to write in historical table: {df_hist.count()}")
+        write_tgt_df(df_hist,'delta','append',f"{adlsRootPath}/{tgt_path}/{hist_tbl_path}")
+      else:
+        print(f"Checking if {hist_tbl_path.lower()} needs column casting")
+        if hist_tbl_path.lower() == 'idw/auth_dns_hist'.lower():
+          print(f"Table name: {hist_tbl_path.lower()} - idw.auth_dns_hist converting decimals to long")
+          df_hist = df_src.withColumn('etl_action_cd',f.lit('I')) \
+                          .withColumn('effective_start_dt',f.current_date()) \
+                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                          .withColumn("CUST_CNSNT_PREF_SID", df_src["CUST_CNSNT_PREF_SID"].cast("long")) \
+                          .withColumn("INSRT_PRCS_ID", df_src["INSRT_PRCS_ID"].cast("long")) \
+                          .withColumn("UPDT_PRCS_ID", df_src["UPDT_PRCS_ID"].cast("long")) \
+                          .withColumn("STG_PRCS_ID", df_src["STG_PRCS_ID"].cast("long")) \
+                          .withColumn("LN_OF_SRVC_SID", df_src["LN_OF_SRVC_SID"].cast("long")) \
+                          .withColumn("BILLG_ACCT_SID", df_src["BILLG_ACCT_SID"].cast("long")) \
+                          .withColumn("ACCS_MTHD_SID", df_src["ACCS_MTHD_SID"].cast("long")) \
+                          .withColumn("CNSNT_TYPE_SID", df_src["CNSNT_TYPE_SID"].cast("long")) \
+                          .withColumn("EMAIL_ADDR_SID", df_src["EMAIL_ADDR_SID"].cast("long")) \
+                          .withColumn("SRC_SYS_ID", df_src["SRC_SYS_ID"].cast("integer"))
+        elif hist_tbl_path.lower() == 'idw/unauth_dns_hist'.lower():
+          print(f"Table name: {hist_tbl_path.lower()} - idw.unauth_dns_hist converting decimals to long")
+          df_hist = df_src.withColumn('etl_action_cd',f.lit('I')) \
+                          .withColumn('effective_start_dt',f.current_date()) \
+                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                          .withColumn('etl_change_ts',f.current_timestamp()) \
+                          .withColumn("DNS_TOG_SID", df_src["DNS_TOG_SID"].cast("long")) \
+                          .withColumn("INSRT_PRCS_ID", df_src["INSRT_PRCS_ID"].cast("long")) \
+                          .withColumn("UPDT_PRCS_ID", df_src["UPDT_PRCS_ID"].cast("long")) \
+                          .withColumn("CDLZ_PRCS_ID", df_src["CDLZ_PRCS_ID"].cast("long")) \
+                          .withColumn("STG_PRCS_ID", df_src["STG_PRCS_ID"].cast("long")) \
+                          .withColumn("SITE_VISITS_CNT", df_src["SITE_VISITS_CNT"].cast("integer")) \
+                          .withColumn("SRC_SYS_ID", df_src["SRC_SYS_ID"].cast("integer"))
+        else:
+          df_hist = df_src.withColumn('etl_action_cd',f.lit('I')) \
+                          .withColumn('effective_start_dt',f.current_date()) \
+                          .withColumn('effective_end_dt',f.lit(None).cast('date')) \
+                          .withColumn('etl_create_ts',f.current_timestamp()) \
+                          .withColumn('etl_change_ts',f.current_timestamp())
+
+        df_tgt_hist=read_tgt_delta(hist_tbl_name,filter_condition='1=2')
+        df_hist=df_hist.select(*list(set(df_hist.columns).intersection(df_tgt_hist.columns)))
+        print(f"Count of records to write in historical table: {df_hist.count()}")
+        write_tgt_df(df_hist,'delta','append',f"{adlsRootPath}{tgt_path}/{hist_tbl_path}")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+try:
+  if 'INCR-LD' in snapshot_load_type:
+    df_tgt=read_tgt_delta(snapshot_tbl_name)
+    df_snapshot = incr_key_merge_process(df_src,df_tgt,key_column_list,snapshot_load_type,src_system)
+    print(f"Count of records to write in snapshot table: {df_snapshot.count()}")
+    write_tgt_df(df_snapshot,'delta','merge',f"{adlsRootPath}/{tgt_path}/{snapshot_tbl_path}",key_column_list)
+  elif 'APPEND-LD' in snapshot_load_type:
+    if 'IAM_ENHANCED' in src_system:
+      df_hist = spark.sql(f"SELECT * FROM {hist_tbl_name}")
+      part_column_list = key_column_list.copy()
+      part_column_list.remove('program')
+      print(f"Filtering history table based on: {part_column_list}")
+      df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = part_column_list,
+                                                      src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+      df_snapshot = df_hist_latest_row.drop(*['etl_action_cd','effective_start_dt','effective_end_dt', \
+                                              'consent_start_date', 'consent_end_date', \
+                                              'etl_create_ts','etl_change_ts','rec_valid_start_date','rec_valid_end_date']) \
+                                      .withColumn('etl_load_dt',f.current_date()) \
+                                      .withColumn('etl_load_ts',f.current_timestamp())
+    elif 'ADOBE' in src_system:
+      df_src_final=df_src.withColumn('file_date',f.to_date(f.split(f.split(f.col('file_name'),'_')[3],'\.')[0],'yyyyMMdd'))\
+                   .withColumn('rnk',f.rank().over(Window.orderBy(f.col('file_date').desc())))\
+                               .filter("rnk=1")\
+                               .drop(*['rnk','file_date'])
+      df_snapshot=df_src_final.withColumn('etl_load_dt',f.current_date())\
+      .withColumn('etl_load_ts',f.current_timestamp())
+    elif ('CDPM' in src_system) or ('CHUB' in src_system) or ('NOR' in src_system and 'service_agreement' in hist_tbl_name.lower()) or ('BMW' in src_system):
+      print("Picking the latest row from historical table...")
+      df_hist = read_tgt_delta(hist_tbl_name)
+      if ('CDPM' in src_system):
+        part_column_list = key_column_list.copy()
+        part_column_list.remove('ban')
+        print(f"Filtering history table based on: {part_column_list}")
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = part_column_list,
+                                                      src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+        df_hist_stg_latest_row = src_de_duplicate_process(df = df_hist_stg,
+                                                          key_column_list = part_column_list,
+                                                          src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+        df_snapshot_stg = df_hist_stg_latest_row.drop(*['etl_action_cd', 'effective_start_dt', 'effective_end_dt', \
+                                                    'etl_create_ts','etl_change_ts']) \
+                                                .withColumn('etl_load_dt',f.current_date()) \
+                                                .withColumn('etl_load_ts',f.current_timestamp())
+      elif ('NOR' in src_system):
+        part_column_list = key_column_list.copy()
+        part_column_list.remove('ban')
+        part_column_list.remove('soc_seq_no')
+        print(f"Filtering history table based on: {part_column_list}")
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = part_column_list,
+                                                      src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+      elif ('CHUB' in src_system):
+        part_column_list = key_column_list.copy()
+        part_column_list.remove('accnt_num')
+        print(f"Filtering history table based on: {part_column_list}")
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = part_column_list,
+                                                      src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+        df_hist_latest_row = df_hist_latest_row.drop("CONSENT_START_DATE","CONSENT_END_DATE")
+        if "PARENTAL" in src_tbl_name.upper():
+          df_hist_latest_row = df_hist_latest_row.drop("CONSENT_DATE_IS_NULL")
+      elif ('BMW' in src_system):
+        part_column_list = key_column_list.copy()
+        part_column_list.remove('tmay_ban_nbr')
+        print(f"Filtering history table based on: {part_column_list}")
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = part_column_list,
+                                                      src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+        df_hist_stg_latest_row = src_de_duplicate_process(df = df_hist_stg,
+                                                          key_column_list = part_column_list,
+                                                          src_order_by_condn = src_order_by_condn + ['etl_create_ts'])
+        df_snapshot_stg = df_hist_stg_latest_row.drop(*['etl_action_cd', 'effective_start_dt', 'effective_end_dt', \
+                                                    'etl_create_ts','etl_change_ts']) \
+                                                .withColumn('etl_load_dt',f.current_date()) \
+                                                .withColumn('etl_load_ts',f.current_timestamp())
+      else:
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = key_column_list,
+                                                      src_order_by_condn = src_order_by_condn
+                                                     )
+      df_snapshot = df_hist_latest_row.drop(*['etl_action_cd', \
+                                              'effective_start_dt','effective_end_dt', \
+                                              'etl_create_ts','etl_change_ts']) \
+                                      .withColumn('etl_load_dt',f.current_date()) \
+                                      .withColumn('etl_load_ts',f.current_timestamp())
+    elif filt_hist:
+      if hist_filter_condtn:
+        print(f"Filtering history table with condition {hist_filter_condtn}")
+        df_hist = read_tgt_delta(hist_tbl_name)
+        df_hist_latest_row = df_hist.filter(hist_filter_condtn)
+        print(f"Filtered {df_hist_latest_row.count()} records")
+      else:
+        print("Picking the latest row from historical table...")
+        df_hist = read_tgt_delta(hist_tbl_name)
+        df_hist_latest_row = src_de_duplicate_process(df = df_hist,
+                                                      key_column_list = snapshot_key_columns,
+                                                      src_order_by_condn = src_order_by_condn
+                                                     )
+      df_snapshot = df_hist_latest_row.drop(*['etl_action_cd', \
+                                              'effective_start_dt','effective_end_dt', \
+                                              'etl_create_ts','etl_change_ts']) \
+                                      .withColumn('etl_load_dt',f.current_date()) \
+                                      .withColumn('etl_load_ts',f.current_timestamp())
+    else:
+      print(f"Checking if {snapshot_tbl_path.lower()} needs column casting")
+      if snapshot_tbl_path.lower() == 'idw/auth_dns'.lower():
+        print(f"Table name: {snapshot_tbl_path.lower()} - idw.auth_dns converting decimals to long")
+        df_snapshot = df_src.withColumn("CUST_CNSNT_PREF_SID", df_src["CUST_CNSNT_PREF_SID"].cast("long")) \
+                        .withColumn("INSRT_PRCS_ID", df_src["INSRT_PRCS_ID"].cast("long")) \
+                        .withColumn("UPDT_PRCS_ID", df_src["UPDT_PRCS_ID"].cast("long")) \
+                        .withColumn("STG_PRCS_ID", df_src["STG_PRCS_ID"].cast("long")) \
+                        .withColumn("LN_OF_SRVC_SID", df_src["LN_OF_SRVC_SID"].cast("long")) \
+                        .withColumn("BILLG_ACCT_SID", df_src["BILLG_ACCT_SID"].cast("long")) \
+                        .withColumn("ACCS_MTHD_SID", df_src["ACCS_MTHD_SID"].cast("long")) \
+                        .withColumn("CNSNT_TYPE_SID", df_src["CNSNT_TYPE_SID"].cast("long")) \
+                        .withColumn("EMAIL_ADDR_SID", df_src["EMAIL_ADDR_SID"].cast("long")) \
+                        .withColumn("SRC_SYS_ID", df_src["SRC_SYS_ID"].cast("integer")) \
+                        .withColumn('etl_load_dt',f.current_date()) \
+                        .withColumn('etl_load_ts',f.current_timestamp())
+      elif snapshot_tbl_path.lower() == 'idw/unauth_dns'.lower():
+        print(f"Table name: {snapshot_tbl_path.lower()} - idw.unauth_dns converting decimals to long")
+        df_snapshot = df_src.withColumn("DNS_TOG_SID", df_src["DNS_TOG_SID"].cast("long")) \
+                        .withColumn("INSRT_PRCS_ID", df_src["INSRT_PRCS_ID"].cast("long")) \
+                        .withColumn("UPDT_PRCS_ID", df_src["UPDT_PRCS_ID"].cast("long")) \
+                        .withColumn("CDLZ_PRCS_ID", df_src["CDLZ_PRCS_ID"].cast("long")) \
+                        .withColumn("STG_PRCS_ID", df_src["STG_PRCS_ID"].cast("long")) \
+                        .withColumn("SITE_VISITS_CNT", df_src["SITE_VISITS_CNT"].cast("integer")) \
+                        .withColumn("SRC_SYS_ID", df_src["SRC_SYS_ID"].cast("integer")) \
+                        .withColumn('etl_load_dt',f.current_date()) \
+                        .withColumn('etl_load_ts',f.current_timestamp())
+      else:
+        df_snapshot = df_src.withColumn('etl_load_dt',f.current_date()) \
+                          .withColumn('etl_load_ts',f.current_timestamp())
+    df_tgt_snapshot = read_tgt_delta(snapshot_tbl_name,filter_condition='1=2')
+    df_snapshot=df_snapshot.select(*list(set(df_snapshot.columns) \
+                                  .intersection(df_tgt_snapshot.columns)))
+    if rec_cnt==0:
+      print(f"Count of records to write in snapshot table: {df_snapshot.count()}")
+      if ('CDPM' in src_system) or ('BMW' in src_system):
+        df_snapshot_stg = df_hist_stg_latest_row.drop(*['etl_action_cd', \
+                                                        'effective_start_dt','effective_end_dt', \
+                                                        'etl_create_ts','etl_change_ts']) \
+                                      .withColumn('etl_load_dt',f.current_date()) \
+                                      .withColumn('etl_load_ts',f.current_timestamp())
+        write_tgt_df(df_snapshot_stg,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{snapshot_tbl_path}_stg")
+        write_tgt_df(df_snapshot,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{snapshot_tbl_path}")
+      else:
+        write_tgt_df(df_snapshot,'delta','overwrite',f"{adlsRootPath}{tgt_path}/{snapshot_tbl_path}")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+
+try:
+  print('Running optimize command on target tables post loading.')
+  if (len(key_column_list) > 0) and (len(key_column_list) <= 9):
+    zorder_columns = ",".join(key_column_list)
+    
+    snapshot_opt_qry = f"OPTIMIZE {snapshot_tbl_name} ZORDER BY {zorder_columns}"
+    print(snapshot_opt_qry)
+    spark.sql(snapshot_opt_qry)
+    
+    snapshot_vcm_qry = f"VACUUM {snapshot_tbl_name} RETAIN 26280 HOURS"
+    print(snapshot_vcm_qry)
+    spark.sql(snapshot_vcm_qry)
+    
+    hist_opt_qry = f"OPTIMIZE {hist_tbl_name} ZORDER BY {zorder_columns}"
+    print(hist_opt_qry)
+    spark.sql(hist_opt_qry)
+    
+    hist_vcm_qry = f"VACUUM {hist_tbl_name} RETAIN 26280 HOURS"
+    print(hist_vcm_qry)
+    spark.sql(hist_vcm_qry)
+  else:
+    snapshot_opt_qry = f"OPTIMIZE {snapshot_tbl_name}"
+    print(snapshot_opt_qry)
+    spark.sql(snapshot_opt_qry)
+    
+    snapshot_vcm_qry = f"VACUUM {snapshot_tbl_name} RETAIN 26280 HOURS"
+    print(snapshot_vcm_qry)
+    spark.sql(snapshot_vcm_qry)
+        
+    hist_opt_qry = f"OPTIMIZE {hist_tbl_name}"
+    print(hist_opt_qry)
+    spark.sql(hist_opt_qry)
+    
+    hist_vcm_qry = f"VACUUM {hist_tbl_name} RETAIN 26280 HOURS"
+    print(hist_vcm_qry)
+    spark.sql(hist_vcm_qry)
+
+  print('Performance optimization completed.')
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+try:
+  print(f"Removing temp path: {tmp_write_path}")
+  dbutils.fs.rm(tmp_write_path,True)
+  print("Temp path deleted!!!")
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+if len(src_tbl_name.split(',')) > 1:
+  try:
+    logger.info(f"Removing temp path: {tmp_write_path_src}")
+    dbutils.fs.rm(tmp_write_path_src,True)
+    logger.info(f"Temp path deleted!!!")
+  except Exception as e:
+    logger.exception('Exception',extra = propertiesException)
+    raise Exception("Failed:",str(e))
+
+try:
+  audit_insert_qry_str = '''
+                            insert into validation.dpi_genius_audit
+                            select {},{},{},{},{},{},{},current_timestamp(),{}
+                         '''.format(repr(source_name), \
+                                    repr(raw_cnt), \
+                                    repr(src_filter_cnt), \
+                                    repr(dedup_cnt), \
+                                    repr(snapshot_insert_cnt), \
+                                    repr(hist_insert_cnt), \
+                                    repr(hist_update_cnt), \
+                                    repr(str(current_date))
+                          )
+  print('Audit table insert query:',audit_insert_qry_str)
+  spark.sql(audit_insert_qry_str)
+except Exception as e:
+  logger.exception('Exception',extra = propertiesException)
+  raise Exception("Failed:",str(e))
+
+
+# Clear cluster cache
+spark.catalog.clearCache()
+
+
+
+
