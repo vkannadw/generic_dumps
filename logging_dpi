@@ -1,0 +1,39 @@
+#name of keyvault
+import os
+# keyvault = "prdedsdpiwu2-akv1"# need to be filled by user. Eg: "devedsdopwu2-akv1" 
+ENV = os.environ.get("ENV")
+keyvault = f"{ENV}edsdpiwu2-akv1"
+print(keyvault)
+#name of instrumentation key in key vault
+#instrumentation_key = "appinsight" # need to be filled by user. Eg:"appinsight" 
+instrumentation_key = "appinsight-InstrumentationKey"
+
+import logging
+from opencensus.ext.azure.trace_exporter import AzureExporter
+from opencensus.trace.samplers import ProbabilitySampler
+from opencensus.trace.tracer import Tracer
+from opencensus.ext.azure.log_exporter import AzureLogHandler
+appinsight_key = dbutils.secrets.get(scope = keyvault, key = instrumentation_key) 
+
+
+def logging(appinsight_key):
+  global logger #Using Global Variable so that the scope of the function is not restricted to just this notebook
+  import logging
+  logger = logging.getLogger(__name__)
+  logger.setLevel(logging.INFO)
+  
+  logger.addHandler(AzureLogHandler(
+    connection_string=f'InstrumentationKey={appinsight_key}'))
+
+def tracer(appinsight_key):
+  global tracer
+  tracer = Tracer(
+      exporter=AzureExporter(
+          connection_string=f'InstrumentationKey={appinsight_key};IngestionEndpoint=https://westus2-1.in.applicationinsights.azure.com/'),
+          sampler=ProbabilitySampler(1.0),
+  )
+
+
+logging(appinsight_key)
+tracer(appinsight_key)
+
