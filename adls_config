@@ -1,0 +1,35 @@
+import os
+env = os.getenv("ENV")
+
+# Name of the ADLS storage
+storageName = os.getenv("storage_account_name")
+# Name of the storage container
+container = os.getenv("data_container_name")
+
+# Client secret of the SPN
+secretScope = f"{env}edsdpiwu2-akv1"
+
+# Client id of the SPN, provided by Platform team
+clientsecret  = f"svc-tmousa-eds-{env}-dpi-devops-clientid"
+secretKey = f"svc-tmousa-eds-{env}-dpi-devops-secret"
+directoryKey = f"svc-tmousa-eds-{env}-dpi-devops-tenantid"
+
+clientID = dbutils.secrets.get(scope = secretScope, key = clientsecret)
+secret = dbutils.secrets.get(scope = secretScope, key = secretKey)
+
+# AAD ID: same for all 
+directoryID = dbutils.secrets.get(scope = secretScope, key = directoryKey)
+
+# Assuming ADLS Gen 2, same for all 
+adlsRootPath = f"abfss://{container}@{storageName}.dfs.core.windows.net/"
+
+# Relative path to the destination folder
+targetDBName = "curated"
+targetDB = "curated"
+
+print(adlsRootPath)
+spark.conf.set(f"fs.azure.account.auth.type.{storageName}.dfs.core.windows.net", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{storageName}.dfs.core.windows.net", "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{storageName}.dfs.core.windows.net", clientID)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{storageName}.dfs.core.windows.net", secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{storageName}.dfs.core.windows.net", f"https://login.microsoftonline.com/{directoryID}/oauth2/token")
